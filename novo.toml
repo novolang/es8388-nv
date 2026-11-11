@@ -1,0 +1,32 @@
+[package]
+name        = "es8388-nv"
+version     = "0.1.0"
+description = "A driver for Everest Semiconductor's ES8388 stereo audio codec with headphone amplifier on an I2C control bus and a board's I2S handle: the MCLK to LRCK ratio table for 8 to 96 kHz, master and slave serial port, I2S, left-justified, right-justified and DSP formats, the ADC input choice and PGA gain, the ALC as a configuration record, the DAC volume, mute, output mixers and the four output volumes, and the power-up and power-down sequences in the order of the user guide, as devices-nv's AudioCodec."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["es8388", "everest", "codec", "audio", "dac", "adc", "alc", "i2s", "i2c", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/es8388-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+[docs.pages]
+"README.md" = "Playing and recording sound through an ES8388 codec"
+
+# Every module of the package checks at the embedded tier, so a program
+# of any tier, embedded, rt or system, may call it.
+[tier]
+tier = "embedded"
+
+# The device program, examples/line_in.nv, has no [[bin]] entry: an entry
+# makes the registry list the package as a program.  tests/device_build.sh
+# builds the program for two boards as the main of a scratch package that
+# depends on this one.
+
+[dependencies]
+# The board's I2C handle, the I2cBus, Timer and I2s traits and the I2S
+# settings.
+embedded-hal-nv = "^0.3.3"
+# The wiring record, the register helpers, and the AudioCodec trait.
+devices-nv      = "^0.3.3"

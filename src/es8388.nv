@@ -1,0 +1,992 @@
+// es8388 — Everest Semiconductor's ES8388, a low-power stereo audio codec
+// with a headphone amplifier, an I2C (or SPI) control port and an I2S, left-
+// justified, right-justified or DSP/PCM serial audio port, as devices-nv's
+// `AudioCodec`.
+//
+// The facts below are from two Everest documents.  The data sheet "ES8388
+// Low Power Stereo Audio CODEC With Headphone Amplifier", Revision 5.0, July
+// 2018, gives the pins, the clock modes (Tables 1 and 2), the control
+// interface, the register map (section 6) and the serial formats.  The user
+// guide "ES8388 User Guide", dated 2011-06-17, gives the register sequences
+// of section 10: start-up, recording, playback, bypass, power-down and
+// resume.  The data sheet gives no sequence.  Where the two disagree the site
+// says which was taken.  Neither document gives a chip identification
+// register: the part has none, so this package offers no `Identifiable`.
+//
+// The reference drivers were read for their fixes and not ported: the
+// `es8388` driver of Espressif's esp_codec_dev (the successor of the esp-adf
+// `es8388.c`) and the Linux kernel's `sound/soc/codecs/es8328.c`.  The Linux
+// driver is for the ES8328, the same family, and its registers agree with the
+// ES8388's only up to 0x27 and from 0x2E: from 0x28 to 0x2D the ES8328 has
+// cross mixers and mono outputs where the ES8388 has the clock and offset
+// registers of the data sheet's Register 43 and 44.  Nothing from that range
+// of the Linux driver is used.
+//
+// The control port.  The two-wire address is 001000x, where x is the CE pin:
+// 0x10 with CE low and 0x11 with CE high.  A write is the register number and
+// the data byte; a read is a write of the register number and, after a
+// repeated start, a read of the byte.  The registers are readable, so every
+// field is changed by reading the register, replacing the bits and writing it
+// back, and the driver keeps no shadow.  A high-to-low transition on CE after
+// power-up selects the SPI port (data sheet, section 5), so a board that
+// drives CE must set it once and leave it.
+//
+// The registers, as this driver uses them (data sheet, section 6):
+//
+//   0x00 CTRL1       SCPReset (7), SameFs (4), SeqEn (3), EnRef (2), VMIDSEL (1:0)
+//   0x01 CTRL2       PdnAna (3), PdnIbiasgen (2), PdnVrefbuf (0)
+//   0x02 CHIPPOWER   ADC and DAC digital, state machines, DLLs, references
+//   0x03 ADCPOWER    inputs, ADCs, microphone bias
+//   0x04 DACPOWER    DACs (7, 6), LOUT1 (5), ROUT1 (4), LOUT2 (3), ROUT2 (2)
+//   0x08 MASTERMODE  MSC (7), MCLKDIV2 (6), BCLK_INV (5), BCLKDIV (4:0)
+//   0x09 ADCCTL1     left PGA (7:4), right PGA (3:0), 3 dB steps to +24 dB
+//   0x0A ADCCTL2     LINSEL (7:6), RINSEL (5:4), DSSEL (3), DSR (2)
+//   0x0B ADCCTL3     DS (7), MONOMIX (4:3), TRI (2)
+//   0x0C ADCCTL4     DATSEL (7:6), ADCLRP (5), ADCWL (4:2), ADCFORMAT (1:0)
+//   0x0D ADCCTL5     ADCFsMode (5), ADCFsRatio (4:0)
+//   0x0F ADCCTL7     ramp rate (7:6), soft ramp (5), ADCMute (2)
+//   0x10 0x11        left and right ADC volume, 0.5 dB steps from 0 to -96 dB
+//   0x12 to 0x16     the ALC and the noise gate
+//   0x17 DACCTL1     DACLRSWAP (7), DACLRP (6), DACWL (5:3), DACFORMAT (2:1)
+//   0x18 DACCTL2     DACFsMode (5), DACFsRatio (4:0)
+//   0x19 DACCTL3     ramp rate (7:6), soft ramp (5), DACMute (2)
+//   0x1A 0x1B        left and right DAC volume, 0.5 dB steps from 0 to -96 dB
+//   0x1D DACCTL7     Mono (5)
+//   0x26 DACCTL16    LMIXSEL (5:3), RMIXSEL (2:0)
+//   0x27 0x2A        left and right output mixers: DAC (7), line (6), line gain (5:3)
+//   0x2B DACCTL21    slrck (7): the ADC and the DAC share one LRCK
+//   0x2E to 0x31     LOUT1, ROUT1, LOUT2, ROUT2 volume, 1.5 dB steps from -45 to +4.5 dB
+//
+// The clock (data sheet, section 4).  In slave mode the part detects the
+// MCLK to LRCK ratio itself, from the ratios of Table 1: 256, 384, 512, 768
+// and 1024 up to 50 kHz, and 128, 192, 256, 384 and 512 above it.  In master
+// mode the ratio is written to ADCCTL5 and DACCTL2 as one of the 5-bit codes
+// of Table 2 (the codes from 10000 are the ratios of the 12 MHz and 24 MHz
+// USB clock), with MCLKDIV2 set for a master clock of twice the table's: 24.576,
+// 22.5792, 36.864 and 33.8688 MHz, and the 24 MHz USB clock.  `clock_plan`
+// finds the code; for 12.288 MHz at 48 kHz it is the ratio 256, code 00010.
+// A ratio that is not a whole number is refused: the table's 8.0182, 8.0214
+// and 44.118 kHz rows are rates of a clock that is not a multiple of the
+// rate.
+//
+// Disagreements between the documents and the reference drivers, and what
+// was taken:
+//   * The microphone gain.  The data sheet gives 0 to +24 dB in 3 dB steps
+//     (codes 0 to 8) and the user guide writes 0x77, +21 dB.  esp_codec_dev
+//     divides the gain in dB by three and writes the same nibble to both
+//     channels, which is what `pga_set` does.
+//   * The ALC target.  The user guide's recommended settings give code 1100
+//     for -4.5 dB; the data sheet's Register 19 gives 1000 for -4.5 dB and
+//     1010 and above for -1.5 dB.  The data sheet is the later document and
+//     is taken, and the user guide's sample code, which writes 0xA0 beside the
+//     comment 0xC0, is not followed.  The user guide's sample code also writes
+//     0xE2 to Register 18 beside "maximum gain 23.5 dB"; the data sheet's code
+//     for 23.5 dB is 101, which makes 0xEA.
+//   * Reserved bits.  The user guide's sequence writes 0x40 to CTRL2, 0x30 and
+//     0x32 to the unmuted ADC and DAC control registers and 0x38 to the
+//     registers 0x28 and 0x29, where the data sheet describes no field.  The
+//     CTRL2 value is written as given, because it starts the reference, and
+//     the mute bits are changed by a read-modify-write that leaves the other
+//     bits of ADCCTL7 and DACCTL3 as they are.  Registers 0x28 and 0x29 are
+//     written with the user guide's 0x38 in the power-up step.
+//   * The reference charge.  The user guide sets VMIDSEL to the 50 kohm
+//     divider at once.  The Linux driver charges the reference capacitors
+//     through the 5 kohm divider for 100 ms first, and the power-up here does
+//     the same before the 50 kohm divider.
+//   * Esp_codec_dev writes 0x35, 0x37 and 0x39 "to disable the internal DLL to
+//     improve 8 kHz".  The data sheet lists no such registers (0x32 to 0x34
+//     are the last of the DAC block it names, and the registers 51 and 52 are
+//     reserved), so the writes are not made.
+//   * Double speed.  esp_codec_dev and Linux leave FsMode at single speed at
+//     96 kHz; the data sheet defines it as "double speed mode" and the
+//     driver sets it for rates above 50 kHz, the boundary of Table 1.
+//   * The word length of a slot.  The data sheet says LRCK/SCLK "is normally
+//     64".  `I2sConfig` has one bit depth and no slot width, so a 16-bit
+//     format asks the handle for 32 bit clocks per frame; whether the part
+//     takes 32 is NOT VERIFIED.  A program that wants 64 asks for 32 bits.
+
+use embedded_hal.{ BoardI2c, BoardTimer, I2cBus, Timer, I2s, I2sConfig, I2sRole, I2sFormat }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
+
+// The registers.
+let CTRL1      = 0x00
+let CTRL2      = 0x01
+let CHIPPOWER  = 0x02
+let ADCPOWER   = 0x03
+let DACPOWER   = 0x04
+let MASTERMODE = 0x08
+let ADCCTL1    = 0x09
+let ADCCTL2    = 0x0A
+let ADCCTL3    = 0x0B
+let ADCCTL4    = 0x0C
+let ADCCTL5    = 0x0D
+let ADCCTL7    = 0x0F
+let ADCVOL_L   = 0x10
+let ADCVOL_R   = 0x11
+let ALC1       = 0x12
+let ALC2       = 0x13
+let ALC3       = 0x14
+let ALC4       = 0x15
+let ALC5       = 0x16
+let DACCTL1    = 0x17
+let DACCTL2    = 0x18
+let DACCTL3    = 0x19
+let DACVOL_L   = 0x1A
+let DACVOL_R   = 0x1B
+let DACCTL7    = 0x1D
+let MIXSEL     = 0x26
+let LMIX       = 0x27
+let MIX_R1     = 0x28
+let MIX_R2     = 0x29
+let RMIX       = 0x2A
+let SAMELRCK   = 0x2B
+let LOUT1VOL   = 0x2E
+let ROUT1VOL   = 0x2F
+let LOUT2VOL   = 0x30
+let ROUT2VOL   = 0x31
+
+// The two-wire addresses: 001000x, x the CE pin.
+let ADDR_CE_LOW  = 0x10
+let ADDR_CE_HIGH = 0x11
+
+// CTRL1 after the reset, and the values the sequences write.
+let CTRL1_DEFAULT = 0x06
+let CTRL1_RESET   = 0x80
+let CTRL1_CHARGE  = 0x07
+let CTRL1_RUN     = 0x05
+
+// The user guide's values.
+let CTRL2_RUN      = 0x40
+let CHIPPOWER_HOLD = 0xF3
+let CHIPPOWER_RUN  = 0x00
+let ADCPOWER_ON    = 0x00
+let ADCPOWER_OFF   = 0xFC
+let DACPOWER_ON    = 0x3C
+let DACPOWER_OFF   = 0xC0
+let SAMELRCK_ON    = 0x80
+let MIX_RESERVED   = 0x38
+let MIX_DAC_ONLY   = 0xB8
+
+// MASTERMODE's bits.
+let MM_MASTER  = 0x80
+let MM_DIV2    = 0x40
+let MM_BCLKINV = 0x20
+
+// The mute bit of ADCCTL7 and DACCTL3.
+let MUTE_BIT = 0x04
+
+// The I2C clock `setup` asks for.
+let I2C_HZ = 400000
+
+// The time the reference capacitors are charged through the 5 kohm divider,
+// in milliseconds (Linux: 100).
+let CHARGE_MS = 100
+
+// The ranges of the gains, in thousandths of a decibel.  The ADC and DAC
+// digital volumes run from 0 dB at code 0 to -96 dB at code 192 in 0.5 dB
+// steps.  The output drivers run from -45 dB at code 0 to +4.5 dB at code 33
+// in 1.5 dB steps.  The PGA runs from 0 to +24 dB in 3 dB steps.  The line
+// signal into the output mixer runs from +6 dB at code 0 to -15 dB at code 7
+// in 3 dB steps.
+let DVOL_MIN_MDB  = -96000
+let DVOL_STEP_MDB = 500
+let DVOL_MAX_CODE = 192
+let OUT_MIN_MDB   = -45000
+let OUT_MAX_MDB   = 4500
+let OUT_STEP_MDB  = 1500
+let OUT_MAX_CODE  = 33
+let PGA_MAX_MDB   = 24000
+let PGA_STEP_MDB  = 3000
+let PGA_MAX_CODE  = 8
+let LINE_MIN_MDB  = -15000
+let LINE_MAX_MDB  = 6000
+let LINE_STEP_MDB = 3000
+
+// The sample rates of the data sheet: 8 to 96 kHz.  The speed mode changes
+// above 50 kHz (Table 1).
+let RATE_MIN    = 8000
+let RATE_MAX    = 96000
+let RATE_DOUBLE = 50000
+
+// What a program says about how the codec is clocked and wired.
+//
+// `mclk_hz` is the master clock the board gives, in hertz.  `invert_bclk`
+// inverts the bit clock the part drives as a master.
+pub @value
+struct Es8388Config
+    mclk_hz: Int
+    invert_bclk: Bool
+
+// The usual wiring: the master clock `mclk_hz`, the bit clock not inverted.
+pub fn config_default(mclk_hz: Int) -> Es8388Config
+    Es8388Config { mclk_hz: mclk_hz, invert_bclk: false }
+
+// The two-wire address for the CE pin: 0x11 high, 0x10 low.
+pub fn address_of(ce_high: Bool) -> Int
+    if ce_high
+        return ADDR_CE_HIGH
+    ADDR_CE_LOW
+
+// The control port: the I2C bus the codec is on.  `setup` makes the bus
+// ready and answers whether the wiring suits it, `read_regs` reads `n`
+// registers from `reg`, `write_reg` writes one, and `pause_ms` waits.
+pub trait Es8388Port
+    fn setup(self) -> Bool [hw]
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+    fn pause_ms(self, ms: Int) [hw]
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+// Reads `n` registers from `reg` into `dst` in one I2C transaction, a
+// write of the register and a repeated start: whether the part answered.
+pub fn i2c_read_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, reg, n, var dst)
+
+// Writes `v` to the register `reg` in one I2C transaction: whether the
+// part acknowledged.
+pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push((v & 0xFF) as u8)
+    dev_bus.wiring_write_from(bus, w, reg, src)
+
+// Makes the bus ready at 400 kHz and answers whether the wiring has an
+// address.
+pub fn i2c_setup<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// ── Registers ────────────────────────────────────────────────────────
+
+// One register, or `None` when the part did not answer.
+pub fn reg_read<P: Es8388Port>(p: P, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(reg, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// Writes `v` to the register `reg`: whether the part acknowledged.
+pub fn reg_write<P: Es8388Port>(p: P, reg: Int, v: Int) -> Bool [hw]
+    p.write_reg(reg, v & 0xFF)
+
+// Sets the bits of `mask` in `reg` to the bits of `flags`, leaving the
+// others, read from the part: whether the part took it.
+pub fn reg_update<P: Es8388Port>(p: P, reg: Int, mask: Int, flags: Int) -> Bool [hw]
+    let Some(old) = reg_read(p, reg) else return false
+    reg_write(p, reg, (old & (0xFF ^ mask)) | (flags & mask))
+
+// ── The clock ────────────────────────────────────────────────────────
+
+// How the clock is divided: `div2` is MCLKDIV2, `ratio` the MCLK to LRCK
+// ratio after the divider, `code` its register code for ADCCTL5 and DACCTL2
+// (bits 4:0), and `double` the speed mode bit (set above 50 kHz).
+pub @value
+struct RatioPlan
+    div2: Bool
+    ratio: Int
+    code: Int
+    double: Bool
+
+// The codes of the 12 MHz USB clock's ratios, from 10000; -1 for any other.
+fn ratio_code_usb(r: Int) -> Int
+    if r == 125
+        return 16
+    if r == 136
+        return 17
+    if r == 250
+        return 18
+    if r == 272
+        return 19
+    if r == 375
+        return 20
+    if r == 500
+        return 21
+    if r == 544
+        return 22
+    if r == 750
+        return 23
+    if r == 1000
+        return 24
+    if r == 1088
+        return 25
+    if r == 1496
+        return 26
+    if r == 1500
+        return 27
+    -1
+
+// The 5-bit ratio code of Table 2 for a ratio of MCLK to LRCK, or -1.  The
+// codes 00000 to 01100 are the ratios of the 12.288, 11.2896, 18.432 and
+// 16.9344 MHz clocks; the codes from 10000 are those of the 12 MHz USB clock.
+pub fn ratio_code(r: Int) -> Int
+    if r == 128
+        return 0
+    if r == 192
+        return 1
+    if r == 256
+        return 2
+    if r == 384
+        return 3
+    if r == 512
+        return 4
+    if r == 576
+        return 5
+    if r == 768
+        return 6
+    if r == 1024
+        return 7
+    if r == 1152
+        return 8
+    if r == 1408
+        return 9
+    if r == 1536
+        return 10
+    if r == 2112
+        return 11
+    if r == 2304
+        return 12
+    ratio_code_usb(r)
+
+// Whether a ratio is one of Table 1, the ratios a slave detects: 256, 384,
+// 512, 768 and 1024 in single speed, 128, 192, 256, 384 and 512 in double.
+pub fn slave_ratio_ok(r: Int, double: Bool) -> Bool
+    if double
+        return r == 128 or r == 192 or r == 256 or r == 384 or r == 512
+    r == 256 or r == 384 or r == 512 or r == 768 or r == 1024
+
+// Whether a master clock is one of the table's with MCLKDIV2 set: twice the
+// 12.288, 11.2896, 18.432 and 16.9344 MHz clocks, and the 24 MHz USB clock.
+fn div2_clock(mclk: Int) -> Bool
+    mclk == 24576000 or mclk == 22579200 or mclk == 36864000 or mclk == 33868800 or mclk == 24000000
+
+// The plan for an effective clock `eff` (the master clock, divided by two
+// when `div2`), or `None` for a clock that is not a whole multiple of the rate
+// and for a ratio the mode does not have.
+fn plan_for(eff: Int, div2: Bool, rate: Int, double: Bool, master: Bool) -> ?RatioPlan
+    if eff % rate != 0
+        return None
+    let r = eff / rate
+    let code = ratio_code(r)
+    if code < 0
+        return None
+    if not master and not slave_ratio_ok(r, double)
+        return None
+    Some(RatioPlan { div2: div2, ratio: r, code: code, double: double })
+
+// The plan for a master clock of `mclk_hz` at the rate `rate`, for a codec
+// that is the clock master (`master`) or a slave: `None` for a rate outside 8
+// to 96 kHz, for a clock that is not a whole multiple of the rate, and for a
+// ratio the mode does not have.  The clocks of twice the table's use
+// MCLKDIV2, as Table 2 does; every other clock is used undivided.
+pub fn clock_plan(mclk_hz: Int, rate: Int, master: Bool) -> ?RatioPlan
+    if rate < RATE_MIN or rate > RATE_MAX or mclk_hz <= 0
+        return None
+    let double = rate > RATE_DOUBLE
+    if div2_clock(mclk_hz)
+        return plan_for(mclk_hz / 2, true, rate, double, master)
+    plan_for(mclk_hz, false, rate, double, master)
+
+// The master clock of a configuration: `mclk_hz`.
+pub fn mclk_of(c: Es8388Config) -> Int
+    c.mclk_hz
+
+// ── The serial port ──────────────────────────────────────────────────
+
+// The word-length code of a bit depth: 16, 24 or 32 bits, or -1.  The part
+// also has 18 and 20 bits, which `AudioFormat` cannot name.
+pub fn wl_code(depth: Int) -> Int
+    if depth == 16
+        return 3
+    if depth == 24
+        return 0
+    if depth == 32
+        return 4
+    -1
+
+// The format code of a framing: 0 for I2S, 1 for left-justified.  The part
+// has 2 for right-justified and 3 for DSP/PCM, which are `rj_format_set` and
+// `dsp_format_set`.
+pub fn fmt_code(f: AudioFraming) -> Int
+    match f
+        AudioFraming.AudioPhilips       => 0
+        AudioFraming.AudioLeftJustified => 1
+
+// ── The named steps ──────────────────────────────────────────────────
+//
+// The sequences, one step per function, so that the order is the one place
+// to read and to test.
+
+// Step: the reset.  CTRL1's SCPReset sets the control port's registers to
+// their defaults, and writing the default value 0x06 releases it.
+pub fn step_reset<P: Es8388Port>(p: P) -> Bool [hw]
+    reg_write(p, CTRL1, CTRL1_RESET) and reg_write(p, CTRL1, CTRL1_DEFAULT)
+
+// Step: the base state after the reset.  The DAC is muted, and the ADC and
+// DAC digital volumes are at 0 dB, where the reset leaves them at -96 dB
+// (the user guide sets 0 dB in its sequence).  The output drivers stay at
+// the reset's -45 dB until the program sets a gain.
+pub fn step_open<P: Es8388Port>(p: P) -> Bool [hw]
+    mute_set(p, true) and reg_write(p, ADCVOL_L, 0) and reg_write(p, ADCVOL_R, 0) and reg_write(p, DACVOL_L, 0) and reg_write(p, DACVOL_R, 0)
+
+// Step: the role and the clock.  MCLKDIV2, the master bit and the bit clock
+// inversion; BCLKDIV is 0, so a master makes its bit clock from Table 2.
+pub fn step_source<P: Es8388Port>(p: P, c: Es8388Config, plan: RatioPlan, master: Bool) -> Bool [hw]
+    var v = 0
+    if master
+        v = v | MM_MASTER
+    if plan.div2
+        v = v | MM_DIV2
+    if c.invert_bclk
+        v = v | MM_BCLKINV
+    reg_write(p, MASTERMODE, v)
+
+// Step: the MCLK to LRCK ratio and the speed mode of both converters.
+pub fn step_ratio<P: Es8388Port>(p: P, plan: RatioPlan) -> Bool [hw]
+    var v = plan.code
+    if plan.double
+        v = v | 0x20
+    reg_write(p, ADCCTL5, v) and reg_write(p, DACCTL2, v)
+
+// Step: the serial port, both directions: the word length, the format and
+// the polarity bit, leaving the channel select of the ADC and the swap of the
+// DAC.  `lrp` is set for DSP mode B.
+pub fn step_serial_port<P: Es8388Port>(p: P, wl: Int, fmt: Int, lrp: Bool) -> Bool [hw]
+    var adc = (wl << 2) | fmt
+    var dac = (wl << 3) | (fmt << 1)
+    if lrp
+        adc = adc | 0x20
+        dac = dac | 0x40
+    reg_update(p, ADCCTL4, 0x3F, adc) and reg_update(p, DACCTL1, 0x7E, dac)
+
+// Step: power up, the user guide's start-up in its order.  The DAC is muted
+// first.  The state machines are held (0xF3), the ADC and the DAC share one
+// LRCK, the reference is enabled and its capacitors are charged through the
+// 5 kohm divider before the 50 kohm divider, the analogue blocks, the ADC
+// with its inputs and microphone bias, and the DAC with its four outputs are
+// powered, the output mixers are set to the DAC alone, and last the state
+// machines are released (0x00).
+pub fn step_power_up<P: Es8388Port>(p: P) -> Bool [hw]
+    if not mute_set(p, true)
+        return false
+    if not reg_write(p, CHIPPOWER, CHIPPOWER_HOLD)
+        return false
+    if not reg_write(p, SAMELRCK, SAMELRCK_ON)
+        return false
+    if not reg_write(p, CTRL1, CTRL1_CHARGE)
+        return false
+    p.pause_ms(CHARGE_MS)
+    if not reg_write(p, CTRL1, CTRL1_RUN)
+        return false
+    reg_write(p, CTRL2, CTRL2_RUN) and reg_write(p, ADCPOWER, ADCPOWER_ON) and reg_write(p, DACPOWER, DACPOWER_ON) and reg_write(p, MIXSEL, 0x00) and reg_write(p, LMIX, MIX_DAC_ONLY) and reg_write(p, MIX_R1, MIX_RESERVED) and reg_write(p, MIX_R2, MIX_RESERVED) and reg_write(p, RMIX, MIX_DAC_ONLY) and reg_write(p, CHIPPOWER, CHIPPOWER_RUN)
+
+// Step: power down to standby, the user guide's section 10.5.  Both
+// converters are muted, the state machines are held, the ADC, its inputs and
+// the microphone bias are powered down, and the DAC and the outputs.  The
+// clock registers are kept, so a power-up needs no new format.
+pub fn step_power_down<P: Es8388Port>(p: P) -> Bool [hw]
+    reg_update(p, ADCCTL7, MUTE_BIT, MUTE_BIT) and mute_set(p, true) and reg_write(p, CHIPPOWER, CHIPPOWER_HOLD) and reg_write(p, ADCPOWER, ADCPOWER_OFF) and reg_write(p, DACPOWER, DACPOWER_OFF)
+
+// Brings the part up: the bus ready, the reset, a check that CTRL1 holds its
+// documented default, and the base state.  The part has no identification
+// register, so the check is that something at the address takes the reset;
+// it is not an identity.  Answers whether the part answered and took every
+// write.
+pub fn start<P: Es8388Port>(p: P) -> Bool [hw]
+    if not p.setup()
+        return false
+    if not step_reset(p)
+        return false
+    let Some(v) = reg_read(p, CTRL1) else return false
+    if v != CTRL1_DEFAULT
+        return false
+    step_open(p)
+
+// ── Format, power, mute and gain ─────────────────────────────────────
+
+// The I2S settings for a format: the board drives the clocks unless the
+// codec does.
+pub fn i2s_config_of(f: AudioFormat) -> I2sConfig
+    var role = I2sRole.I2sMaster
+    if f.codec_is_master
+        role = I2sRole.I2sSlave
+    var layout = I2sFormat.I2sPhilips
+    if f.framing == AudioFraming.AudioLeftJustified
+        layout = I2sFormat.I2sLeftJustified
+    I2sConfig { sample_rate: f.sample_rate, bit_depth: f.bit_depth, channels: f.channels,
+                role: role, format: layout }
+
+// The plan for a format, or `None` when the codec cannot make it: a depth
+// other than 16, 24 or 32, a mono format (the part frames two slots), or a
+// rate and clock `clock_plan` refuses.
+pub fn plan_of(c: Es8388Config, f: AudioFormat) -> ?RatioPlan
+    if not dev_audio.audio_format_valid(f) or wl_code(f.bit_depth) < 0 or f.channels != 2
+        return None
+    clock_plan(mclk_of(c), f.sample_rate, f.codec_is_master)
+
+// Programs the codec for a format and configures and enables the board's
+// I2S handle for it: the plan found, the handle configured and enabled (the
+// part needs its clocks to run before its registers are final), then the
+// role and clock, the ratio and the serial port.
+pub fn format_set<P: Es8388Port, S: I2s>(p: P, i2s: S, c: Es8388Config, f: AudioFormat) -> Bool [hw]
+    let Some(plan) = plan_of(c, f) else return false
+    if not i2s.configure(i2s_config_of(f))
+        return false
+    if not i2s.enable()
+        return false
+    step_source(p, c, plan, f.codec_is_master) and step_ratio(p, plan) and step_serial_port(p, wl_code(f.bit_depth), fmt_code(f.framing), false)
+
+// Powers the converters up or down.  Up is `step_power_up`: the DAC is
+// muted and stays muted until `codec_set_mute(false)`.  Down is
+// `step_power_down`, and the board's I2S handle is disabled after it.
+pub fn power_set<P: Es8388Port, S: I2s>(p: P, i2s: S, on: Bool) -> Bool [hw]
+    if on
+        return step_power_up(p)
+    let ok = step_power_down(p)
+    i2s.disable()
+    ok
+
+// Mutes or unmutes the DAC: DACCTL3's mute bit, which ramps when the soft
+// ramp bit is set, as it is after the reset.
+pub fn mute_set<P: Es8388Port>(p: P, on: Bool) -> Bool [hw]
+    var flags = 0
+    if on
+        flags = MUTE_BIT
+    reg_update(p, DACCTL3, MUTE_BIT, flags)
+
+// Whether the DAC is muted; `None` when the part did not answer.
+pub fn mute_get<P: Es8388Port>(p: P) -> ?Bool [hw]
+    let Some(v) = reg_read(p, DACCTL3) else return None
+    Some((v & MUTE_BIT) != 0)
+
+// Mutes or unmutes the ADC's digital output: ADCCTL7's mute bit.  The input
+// path of `AudioCodec` has no mute; this is the part's.
+pub fn adc_mute_set<P: Es8388Port>(p: P, on: Bool) -> Bool [hw]
+    var flags = 0
+    if on
+        flags = MUTE_BIT
+    reg_update(p, ADCCTL7, MUTE_BIT, flags)
+
+// The register code of a digital volume (the ADC's or the DAC's) for a gain
+// in thousandths of a decibel: 0 dB is code 0 and the step is 0.5 dB down to
+// -96 dB, code 192.  A request above 0 dB is 0 dB; `None` below -96 dB.
+pub fn dvol_code(g: MilliDb) -> ?Int
+    match dev_audio.audio_gain_step(g, DVOL_MIN_MDB, 0, DVOL_STEP_MDB)
+        Some(s) => Some(0 - s.mdb / DVOL_STEP_MDB)
+        None    => None
+
+// The gain of a digital volume code, in thousandths of a decibel.  A code
+// above 192 is read as -96 dB.
+pub fn dvol_mdb(code: Int) -> Int
+    var c = code
+    if c > DVOL_MAX_CODE
+        c = DVOL_MAX_CODE
+    0 - c * DVOL_STEP_MDB
+
+// The register code of an output driver's volume for a gain: -45 dB is
+// code 0, 0 dB code 30 and +4.5 dB code 33, in 1.5 dB steps.  `None` below
+// -45 dB; above +4.5 dB is +4.5 dB.
+pub fn out_code(g: MilliDb) -> ?Int
+    match dev_audio.audio_gain_step(g, OUT_MIN_MDB, OUT_MAX_MDB, OUT_STEP_MDB)
+        Some(s) => Some((s.mdb - OUT_MIN_MDB) / OUT_STEP_MDB)
+        None    => None
+
+// The gain of an output volume code, in thousandths of a decibel.  A code
+// above 33 is read as +4.5 dB, the top of the documented range.
+pub fn out_mdb(code: Int) -> Int
+    var c = code & 0x3F
+    if c > OUT_MAX_CODE
+        c = OUT_MAX_CODE
+    OUT_MIN_MDB + c * OUT_STEP_MDB
+
+// The PGA code for a gain: 3 dB steps from 0 to +24 dB.  `None` below 0 dB;
+// above +24 dB is +24 dB.
+pub fn pga_code(g: MilliDb) -> ?Int
+    match dev_audio.audio_gain_step(g, 0, PGA_MAX_MDB, PGA_STEP_MDB)
+        Some(s) => Some(s.mdb / PGA_STEP_MDB)
+        None    => None
+
+// The gain of a PGA code, in thousandths of a decibel.  A code above 8 is
+// read as +24 dB.
+pub fn pga_mdb(code: Int) -> Int
+    var c = code
+    if c > PGA_MAX_CODE
+        c = PGA_MAX_CODE
+    c * PGA_STEP_MDB
+
+fn output_gain_set<P: Es8388Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
+    let Some(code) = out_code(g) else return None
+    if not reg_write(p, LOUT1VOL, code) or not reg_write(p, ROUT1VOL, code) or not reg_write(p, LOUT2VOL, code) or not reg_write(p, ROUT2VOL, code)
+        return None
+    Some(MilliDb { mdb: out_mdb(code) })
+
+// Sets the output gain or the input gain to the largest step at or below
+// `g`: the gain set, or `None` when `g` is below the path's range or the
+// part did not take it.  The output gain is the four output drivers,
+// LOUT1, ROUT1, LOUT2 and ROUT2, together; the DAC's digital volume is
+// `dac_volume_set`.  The input gain is the PGA of both channels; the ADC's
+// digital volume is `adc_volume_set`.
+pub fn gain_set<P: Es8388Port>(p: P, path: CodecPath, g: MilliDb) -> ?MilliDb [hw]
+    match path
+        CodecPath.CodecOutput => output_gain_set(p, g)
+        CodecPath.CodecInput  => pga_set(p, g, g)
+
+// Sets the PGA of the left and the right channel, each to the largest step
+// at or below its request: the left gain set, or `None` when either request
+// is below 0 dB or the part did not take it.
+pub fn pga_set<P: Es8388Port>(p: P, left: MilliDb, right: MilliDb) -> ?MilliDb [hw]
+    let Some(l) = pga_code(left) else return None
+    let Some(r) = pga_code(right) else return None
+    if not reg_write(p, ADCCTL1, (l << 4) | r)
+        return None
+    Some(MilliDb { mdb: pga_mdb(l) })
+
+fn output_gain_get<P: Es8388Port>(p: P) -> ?MilliDb [hw]
+    let Some(v) = reg_read(p, LOUT1VOL) else return None
+    Some(MilliDb { mdb: out_mdb(v) })
+
+fn input_gain_get<P: Es8388Port>(p: P) -> ?MilliDb [hw]
+    let Some(v) = reg_read(p, ADCCTL1) else return None
+    Some(MilliDb { mdb: pga_mdb((v >> 4) & 0x0F) })
+
+// The gain of a path as the part holds it, or `None` when it did not
+// answer.  The output gain is LOUT1's; the input gain is the left PGA's.
+pub fn gain_get<P: Es8388Port>(p: P, path: CodecPath) -> ?MilliDb [hw]
+    match path
+        CodecPath.CodecOutput => output_gain_get(p)
+        CodecPath.CodecInput  => input_gain_get(p)
+
+// ── Settings the trait has no place for ──────────────────────────────
+
+// The DAC digital volume, both channels: the largest step at or below `g`,
+// 0 dB to -96 dB in 0.5 dB steps, below the output drivers' gain.  The gain
+// set, or `None`.
+pub fn dac_volume_set<P: Es8388Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
+    let Some(code) = dvol_code(g) else return None
+    if not reg_write(p, DACVOL_L, code) or not reg_write(p, DACVOL_R, code)
+        return None
+    Some(MilliDb { mdb: dvol_mdb(code) })
+
+// The DAC digital volume as the part holds it (the left channel's).
+pub fn dac_volume_get<P: Es8388Port>(p: P) -> ?MilliDb [hw]
+    let Some(v) = reg_read(p, DACVOL_L) else return None
+    Some(MilliDb { mdb: dvol_mdb(v) })
+
+// The ADC digital volume, both channels, as `dac_volume_set` does for the
+// DAC.  The reset value is -96 dB; `step_open` sets 0 dB.
+pub fn adc_volume_set<P: Es8388Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
+    let Some(code) = dvol_code(g) else return None
+    if not reg_write(p, ADCVOL_L, code) or not reg_write(p, ADCVOL_R, code)
+        return None
+    Some(MilliDb { mdb: dvol_mdb(code) })
+
+// The ADC digital volume as the part holds it (the left channel's).
+pub fn adc_volume_get<P: Es8388Port>(p: P) -> ?MilliDb [hw]
+    let Some(v) = reg_read(p, ADCVOL_L) else return None
+    Some(MilliDb { mdb: dvol_mdb(v) })
+
+// The analogue input of the ADC: the line pair LIN1 and RIN1, the pair LIN2
+// and RIN2, or the differential input of the pairs LIN1 - RIN1 or LIN2 -
+// RIN2.
+pub @value
+enum InputSel
+    InLine1
+    InLine2
+    InDiff1
+    InDiff2
+
+// Selects the ADC's analogue input, leaving the PGA gain.  The differential
+// pair is chosen by DS (ADCCTL3 bit 7) for both channels.
+pub fn input_set<P: Es8388Port>(p: P, sel: InputSel) -> Bool [hw]
+    match sel
+        InputSel.InLine1 => reg_update(p, ADCCTL2, 0xFC, 0x00)
+        InputSel.InLine2 => reg_update(p, ADCCTL2, 0xFC, 0x50)
+        InputSel.InDiff1 => reg_update(p, ADCCTL2, 0xFC, 0xF0) and reg_update(p, ADCCTL3, 0x80, 0x00)
+        InputSel.InDiff2 => reg_update(p, ADCCTL2, 0xFC, 0xF0) and reg_update(p, ADCCTL3, 0x80, 0x80)
+
+// Chooses which ADC feeds which slot of the frame (DATSEL): 0 left to left
+// and right to right, 1 the left ADC in both, 2 the right ADC in both, 3 the
+// two swapped.  False for another number.
+pub fn adc_data_set<P: Es8388Port>(p: P, sel: Int) -> Bool [hw]
+    if sel < 0 or sel > 3
+        return false
+    reg_update(p, ADCCTL4, 0xC0, sel << 6)
+
+// Plays the average of the two slots in both DACs (DACCTL7's Mono) or the
+// stereo signal.
+pub fn dac_mono_set<P: Es8388Port>(p: P, on: Bool) -> Bool [hw]
+    var flags = 0
+    if on
+        flags = 0x20
+    reg_update(p, DACCTL7, 0x20, flags)
+
+// Enables the output drivers: LOUT1 and ROUT1 (`out1`), LOUT2 and ROUT2
+// (`out2`).  The power-up enables all four.
+pub fn outputs_set<P: Es8388Port>(p: P, out1: Bool, out2: Bool) -> Bool [hw]
+    var flags = 0
+    if out1
+        flags = flags | 0x30
+    if out2
+        flags = flags | 0x0C
+    reg_update(p, DACPOWER, 0x3C, flags)
+
+// Sets the volume of LOUT1 and ROUT1 (`out2` false) or of LOUT2 and ROUT2:
+// the gain set, or `None` below -45 dB or when the part did not take it.
+pub fn out_volume_set<P: Es8388Port>(p: P, out2: Bool, g: MilliDb) -> ?MilliDb [hw]
+    let Some(code) = out_code(g) else return None
+    var left = LOUT1VOL
+    var right = ROUT1VOL
+    if out2
+        left = LOUT2VOL
+        right = ROUT2VOL
+    if not reg_write(p, left, code) or not reg_write(p, right, code)
+        return None
+    Some(MilliDb { mdb: out_mdb(code) })
+
+// The line gain code of the output mixer for a request: +6 dB is code 0 and
+// -15 dB code 7, in 3 dB steps; `None` below -15 dB.
+pub fn line_code(g: MilliDb) -> ?Int
+    match dev_audio.audio_gain_step(g, LINE_MIN_MDB, LINE_MAX_MDB, LINE_STEP_MDB)
+        Some(s) => Some((LINE_MAX_MDB - s.mdb) / LINE_STEP_MDB)
+        None    => None
+
+// Sets the two output mixers: whether the DAC reaches the outputs (`dac`),
+// whether the line input does (`line`) and at what gain (`line_gain`, +6 to
+// -15 dB), and whether the line input is the pair 2 (`line2`) or the pair 1.
+// The gain set, or `None` when the gain is below the range or the part did
+// not take it.
+pub fn mixer_set<P: Es8388Port>(p: P, dac: Bool, line: Bool, line2: Bool,
+                                line_gain: MilliDb) -> ?MilliDb [hw]
+    let Some(code) = line_code(line_gain) else return None
+    var sel = 0x00
+    if line2
+        sel = 0x09
+    var v = code << 3
+    if dac
+        v = v | 0x80
+    if line
+        v = v | 0x40
+    if not reg_write(p, MIXSEL, sel) or not reg_write(p, LMIX, v) or not reg_write(p, RMIX, v)
+        return None
+    Some(MilliDb { mdb: LINE_MAX_MDB - code * LINE_STEP_MDB })
+
+// Puts both serial ports in DSP/PCM mode, A (`b` false) or B (`b` true,
+// the polarity bit set), at the word length of `depth`; the handle is the
+// caller's to configure for it.  False for a depth the part has not.
+pub fn dsp_format_set<P: Es8388Port>(p: P, depth: Int, b: Bool) -> Bool [hw]
+    let wl = wl_code(depth)
+    if wl < 0
+        return false
+    step_serial_port(p, wl, 3, b)
+
+// Puts both serial ports in the right-justified format at the word length
+// of `depth`; `AudioFraming` has no such framing.  False for a depth the part
+// has not.
+pub fn rj_format_set<P: Es8388Port>(p: P, depth: Int) -> Bool [hw]
+    let wl = wl_code(depth)
+    if wl < 0
+        return false
+    step_serial_port(p, wl, 2, false)
+
+// ── The ALC ──────────────────────────────────────────────────────────
+
+// The ALC and the noise gate as the data sheet's Registers 18 to 22 hold them,
+// each field the register's code.  `select` is 0 for off, 1 for the right
+// channel, 2 for the left and 3 for stereo.  `max_gain` is -6.5 dB at 0 and
+// 6 dB more per step to +35.5 dB; `min_gain` is -12 dB at 0 and 6 dB more
+// per step to +30 dB; `target` is -16.5 dB at 0 and 1.5 dB more per step to
+// -6 dB at 7, -4.5 dB at 8 and -3 dB at 9, with 10 to 15 all -1.5 dB.  `hold`
+// is 0 ms at 0 and doubles from 2.67 ms; `decay` and `attack` double per
+// step from 410 us and 104 us.  `limiter` selects the limiter mode,
+// `zero_cross` the zero-cross detector, `timeout` its time-out, `window` the
+// peak detector's window in sixteens of samples (6 is 96).  `gate` enables
+// the noise gate, whose threshold `gate_threshold` is -76.5 dBFS at 0 and
+// 1.5 dB more per step, and which mutes the ADC (`gate_mute`) or holds the
+// gain.
+pub @value
+struct AlcConfig
+    select: Int
+    max_gain: Int
+    min_gain: Int
+    target: Int
+    hold: Int
+    decay: Int
+    attack: Int
+    limiter: Bool
+    zero_cross: Bool
+    timeout: Bool
+    window: Int
+    gate: Bool
+    gate_threshold: Int
+    gate_mute: Bool
+
+// The ALC for voice, the user guide's recommended settings for microphone
+// recording with the data sheet's codes: stereo, a target of -4.5 dB, gain
+// from 0 dB to 23.5 dB, a hold of 0, a decay of 820 us and an attack of
+// 416 us per step, the noise gate at -40.5 dB muting the ADC.
+pub fn alc_voice() -> AlcConfig
+    AlcConfig { select: 3, max_gain: 5, min_gain: 2, target: 8, hold: 0, decay: 1, attack: 2,
+                limiter: false, zero_cross: false, timeout: false, window: 6, gate: true,
+                gate_threshold: 24, gate_mute: true }
+
+// The ALC for generic recording, the user guide's third column: stereo, a
+// target of -12 dB, gain from -12 dB to 35.5 dB, a decay of 13.1 ms and an
+// attack of 13.3 ms per step, the noise gate at -51 dB holding the gain.
+pub fn alc_generic() -> AlcConfig
+    AlcConfig { select: 3, max_gain: 7, min_gain: 0, target: 3, hold: 0, decay: 5, attack: 7,
+                limiter: false, zero_cross: false, timeout: false, window: 6, gate: true,
+                gate_threshold: 17, gate_mute: false }
+
+// Whether every field of a configuration is inside its register field.
+pub fn alc_valid(c: AlcConfig) -> Bool
+    c.select >= 0 and c.select <= 3 and c.max_gain >= 0 and c.max_gain <= 7 and c.min_gain >= 0 and c.min_gain <= 7 and c.target >= 0 and c.target <= 15 and c.hold >= 0 and c.hold <= 15 and c.decay >= 0 and c.decay <= 15 and c.attack >= 0 and c.attack <= 15 and c.window >= 0 and c.window <= 31 and c.gate_threshold >= 0 and c.gate_threshold <= 31
+
+fn flag_bit(b: Bool, bit: Int) -> Int
+    if b
+        return bit
+    0
+
+// Writes the ALC and the noise gate: Registers 18 to 22 in order, the
+// selection first so that the ALC starts from the other fields.  False for a
+// configuration `alc_valid` refuses, without a write.
+pub fn alc_set<P: Es8388Port>(p: P, c: AlcConfig) -> Bool [hw]
+    if not alc_valid(c)
+        return false
+    let r4 = flag_bit(c.limiter, 0x80) | flag_bit(c.zero_cross, 0x40) | flag_bit(c.timeout, 0x20) | c.window
+    var ngg = 0
+    if c.gate_mute
+        ngg = 1
+    let r5 = (c.gate_threshold << 3) | (ngg << 1) | flag_bit(c.gate, 1)
+    reg_write(p, ALC1, (c.select << 6) | (c.max_gain << 3) | c.min_gain) and reg_write(p, ALC2, (c.target << 4) | c.hold) and reg_write(p, ALC3, (c.decay << 4) | c.attack) and reg_write(p, ALC4, r4) and reg_write(p, ALC5, r5)
+
+// Turns the ALC off, leaving its other settings.
+pub fn alc_off<P: Es8388Port>(p: P) -> Bool [hw]
+    reg_update(p, ALC1, 0xC0, 0)
+
+// ── The codec on a board's I2C bus and I2S handle ────────────────────
+
+// An ES8388 on a board's I2C bus at the address `w.addr`, 0x10 or 0x11 by the
+// CE pin, and the board's I2S handle that carries its samples.
+pub struct Es8388<S: I2s>
+    bus: BoardI2c
+    w: DeviceWiring
+    i2s: S
+    cfg: Es8388Config
+
+// The codec at `w.addr` on the board's I2C bus, with the I2S handle `i2s`
+// for its samples.  Nothing is sent.  A struct with a generic field cannot
+// be a `@value`, so the codec is one cell of the arena, built in a `system`
+// block, the one allocation of the package.
+pub fn attach<S: I2s>(bus: BoardI2c, w: DeviceWiring, i2s: S, cfg: Es8388Config) -> Es8388<S>
+    system
+        return Es8388 { bus: bus, w: w, i2s: i2s, cfg: cfg }
+
+impl Es8388Port for Es8388
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        i2c_write(self.bus, self.w, reg, v)
+
+    fn pause_ms(self, ms: Int) [hw]
+        BoardTimer { id: 0 }.delay_ms(ms)
+
+impl Es8388
+    // Brings the part up (`start`): the reset, the check of CTRL1 and the
+    // base state.  The caller has powered the part and waited for its supply.
+    fn begin(self) -> Bool [hw]
+        start(self)
+
+    // One register's byte, `None` when the part did not answer.
+    fn reg(self, r: Int) -> ?Int [hw]
+        reg_read(self, r)
+
+    // Writes a register.
+    fn set_reg(self, r: Int, v: Int) -> Bool [hw]
+        reg_write(self, r, v)
+
+    // The DAC digital volume (`dac_volume_set`).
+    fn set_dac_volume(self, g: MilliDb) -> ?MilliDb [hw]
+        dac_volume_set(self, g)
+
+    // The DAC digital volume as the part holds it.
+    fn dac_volume(self) -> ?MilliDb [hw]
+        dac_volume_get(self)
+
+    // The ADC digital volume (`adc_volume_set`).
+    fn set_adc_volume(self, g: MilliDb) -> ?MilliDb [hw]
+        adc_volume_set(self, g)
+
+    // The ADC digital volume as the part holds it.
+    fn adc_volume(self) -> ?MilliDb [hw]
+        adc_volume_get(self)
+
+    // The ADC mute (`adc_mute_set`).
+    fn set_adc_mute(self, on: Bool) -> Bool [hw]
+        adc_mute_set(self, on)
+
+    // The PGA of each channel (`pga_set`).
+    fn set_pga(self, left: MilliDb, right: MilliDb) -> ?MilliDb [hw]
+        pga_set(self, left, right)
+
+    // The analogue input (`input_set`) and the slot each ADC fills.
+    fn set_input(self, sel: InputSel) -> Bool [hw]
+        input_set(self, sel)
+
+    fn set_adc_data(self, sel: Int) -> Bool [hw]
+        adc_data_set(self, sel)
+
+    // The output drivers (`outputs_set`, `out_volume_set`).
+    fn set_outputs(self, out1: Bool, out2: Bool) -> Bool [hw]
+        outputs_set(self, out1, out2)
+
+    fn set_out_volume(self, out2: Bool, g: MilliDb) -> ?MilliDb [hw]
+        out_volume_set(self, out2, g)
+
+    // The output mixers (`mixer_set`) and the mono mix (`dac_mono_set`).
+    fn set_mixer(self, dac: Bool, line: Bool, line2: Bool, line_gain: MilliDb) -> ?MilliDb [hw]
+        mixer_set(self, dac, line, line2, line_gain)
+
+    fn set_dac_mono(self, on: Bool) -> Bool [hw]
+        dac_mono_set(self, on)
+
+    // The ALC (`alc_set`, `alc_off`).
+    fn set_alc(self, c: AlcConfig) -> Bool [hw]
+        alc_set(self, c)
+
+    fn alc_disable(self) -> Bool [hw]
+        alc_off(self)
+
+    // DSP and right-justified modes (`dsp_format_set`, `rj_format_set`).
+    fn set_dsp_format(self, depth: Int, b: Bool) -> Bool [hw]
+        dsp_format_set(self, depth, b)
+
+    fn set_rj_format(self, depth: Int) -> Bool [hw]
+        rj_format_set(self, depth)
+
+    // Stops the I2S handle's clocks without powering the codec down.
+    fn i2s_stop(self) [hw]
+        self.i2s.disable()
+
+impl AudioCodec[hw] for Es8388
+    fn codec_set_format(self, f: AudioFormat) -> Bool [hw]
+        format_set(self, self.i2s, self.cfg, f)
+
+    fn codec_set_power(self, on: Bool) -> Bool [hw]
+        power_set(self, self.i2s, on)
+
+    fn codec_set_mute(self, on: Bool) -> Bool [hw]
+        mute_set(self, on)
+
+    fn codec_is_muted(self) -> ?Bool [hw]
+        mute_get(self)
+
+    fn codec_set_gain(self, path: CodecPath, g: MilliDb) -> ?MilliDb [hw]
+        gain_set(self, path, g)
+
+    fn codec_gain(self, path: CodecPath) -> ?MilliDb [hw]
+        gain_get(self, path)

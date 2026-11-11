@@ -1,0 +1,107 @@
+/* line_in.nv: a program that brings an ES8388 up and passes its line input
+ * through to its headphone output, 128 stereo frames at a time
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *         or make this file the main of a package that depends on
+ *         es8388-nv and run
+ *             novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The part is an ES8388 on a breakout board or a module such as M5Stack's
+ * Audio Module, wired to the board's first I2C bus (SDA, SCL; CE to ground
+ * for the address 0x10) and to its I2S block (MCLK, SCLK, LRCK, DSDIN to
+ * the board's data output, ASDOUT to its data input).  The board is the I2S
+ * master at 48 kHz, 16 bits, with MCLK at 256 x fs = 12.288 MHz, so the
+ * codec is a slave and detects the ratio of Table 1 itself.  The line signal
+ * goes into LIN1 and RIN1; the headphones are on LOUT1 and ROUT1.
+ *
+ * The program does what a pass-through does, in the order the package's
+ * documentation gives: `begin` resets the part, `codec_set_format`
+ * configures the board's I2S block and the codec's clock and serial port,
+ * `codec_set_power(true)` runs the user guide's start-up with the DAC muted,
+ * the input gain is set to 0 dB and the output gain to -12 dB, and
+ * `codec_set_mute(false)` opens the output once the first buffer is queued.
+ * It prints one line per step over the board's UART.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the I2S block, the
+ * UART and the timer.  The driver allocates one cell at `attach`; the
+ * program allocates nothing after it starts.
+ *
+ * The I2S block: neither the nRF52840-DK's nor the nRF54LM20-DK's board
+ * package has an I2S block driver, and embedded-hal-nv has no board handle
+ * for one.  The program is therefore written against the `I2s` trait and is
+ * given `NoI2s`, a stand-in that refuses to be configured and moves no
+ * samples.  The I2C bus is the boards' TWIM, so `begin` runs on the bus; with
+ * no codec on it, both images print "no answer from the codec at 0x10".  The
+ * part has not been driven on a board.
+ */
+use embedded_hal.{ I2s, I2sConfig, BoardI2c }
+use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
+use dev_bus
+use es8388
+
+// The stand-in for a board's I2S block that is not there.
+@value
+struct NoI2s
+    id: Int
+
+impl I2s for NoI2s
+    fn configure(self, c: I2sConfig) -> Bool [hw]
+        false
+
+    fn sample_rate(self) -> Int [hw]
+        0
+
+    fn enable(self) -> Bool [hw]
+        false
+
+    fn disable(self) [hw]
+        pass
+
+    fn transmit(self, var buf: Vec[i32; 256]) -> Int [hw]
+        -1
+
+    fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
+        -1
+
+    fn xruns(self) -> Int [hw]
+        0
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    let i2s = NoI2s { id: 0 }
+    let part = es8388.attach(BoardI2c { id: 0 }, dev_bus.wiring_i2c(0, es8388.address_of(false)), i2s,
+                             es8388.config_default(12288000))
+    if not part.begin()
+        hal.uart.write("no answer from the codec at 0x10\n")
+    else
+        hal.uart.write("codec found\n")
+    let f = AudioFormat { sample_rate: 48000, bit_depth: 16, channels: 2,
+                          framing: AudioFraming.AudioPhilips, codec_is_master: false }
+    if not part.codec_set_format(f)
+        hal.uart.write("format refused\n")
+    if not part.codec_set_power(true)
+        hal.uart.write("power up refused\n")
+    let heard = part.codec_set_gain(CodecPath.CodecInput, MilliDb { mdb: 0 })
+    if heard == None
+        hal.uart.write("input gain refused\n")
+    let set = part.codec_set_gain(CodecPath.CodecOutput, MilliDb { mdb: -12000 })
+    if set == None
+        hal.uart.write("volume refused\n")
+    var buf: Vec[i32; 256] = Vec.new()
+    let got = i2s.receive(var buf, 256)
+    if got < 0
+        hal.uart.write("no samples received\n")
+    elif i2s.transmit(var buf) < 0
+        hal.uart.write("no samples sent\n")
+    elif not part.codec_set_mute(false)
+        hal.uart.write("unmute refused\n")
+    while true
+        let n = i2s.receive(var buf, 256)
+        if n < 0
+            hal.timer.delay_ms(500)
+        else
+            let _ = i2s.transmit(var buf)

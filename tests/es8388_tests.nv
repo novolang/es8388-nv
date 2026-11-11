@@ -1,0 +1,1065 @@
+// es8388_tests — the driver over a double of the part: a register file on an
+// I2C bus that starts from the data sheet's default values and resets to them
+// when CTRL1's SCPReset is written, and a double of the board's I2S handle.
+// The log keeps every transaction in a form the tests compare, so the order
+// of the steps, which the user guide fixes, is pinned register by register.
+//
+// Log entries: a write of `v` to register `r` is `65536 + r * 256 + v`; a
+// read of one register is `131072 + r * 256 + 1`; a pause of `ms`
+// milliseconds is `196608 + ms`.  The helpers `lw`, `lr` and `lp` build
+// them.
+//
+// The chip's state, in `st`: 0 is 1 when a part is there, 1 the writes seen,
+// 2 the write number from which every write is refused (0 for none), 4 the
+// I2C clock set, 5 a register whose read is refused plus one (0 for none),
+// 6 the pauses seen, 7 1 when writes to register 0 are acknowledged and
+// ignored, 9 the entries in the log.
+//
+// The I2S double's state, in `ist`: 0 configure calls, 1 sample rate, 2 bit
+// depth, 3 channels, 4 role (0 master, 1 slave), 5 format (0 Philips, 1
+// left-justified), 6 enabled, 8 refuse configure, 10 disable calls, 13
+// refuse enable.
+
+use std.test
+use embedded_hal.{ BoardI2c, I2cBus, I2s, I2sConfig, I2sRole, I2sFormat }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
+use es8388
+use es8388.{ Es8388Port, Es8388Config, RatioPlan, AlcConfig, InputSel }
+
+// ── The doubles ──────────────────────────────────────────────────────
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The data sheet's default values of the registers the tests use.
+fn load_defaults(c: Chip)
+    c.regs.insert(0x00, 0x06)
+    c.regs.insert(0x01, 0x5C)
+    c.regs.insert(0x02, 0xC3)
+    c.regs.insert(0x03, 0xFC)
+    c.regs.insert(0x04, 0xC0)
+    c.regs.insert(0x07, 0x7C)
+    c.regs.insert(0x08, 0x80)
+    c.regs.insert(0x09, 0x00)
+    c.regs.insert(0x0A, 0x00)
+    c.regs.insert(0x0B, 0x02)
+    c.regs.insert(0x0C, 0x00)
+    c.regs.insert(0x0D, 0x06)
+    c.regs.insert(0x0E, 0x30)
+    c.regs.insert(0x0F, 0x20)
+    c.regs.insert(0x10, 0xC0)
+    c.regs.insert(0x11, 0xC0)
+    c.regs.insert(0x12, 0x38)
+    c.regs.insert(0x13, 0xB0)
+    c.regs.insert(0x14, 0x32)
+    c.regs.insert(0x15, 0x06)
+    c.regs.insert(0x16, 0x00)
+    c.regs.insert(0x17, 0x00)
+    c.regs.insert(0x18, 0x06)
+    c.regs.insert(0x19, 0x22)
+    c.regs.insert(0x1A, 0xC0)
+    c.regs.insert(0x1B, 0xC0)
+    c.regs.insert(0x1D, 0x00)
+    c.regs.insert(0x26, 0x00)
+    c.regs.insert(0x27, 0x38)
+    c.regs.insert(0x28, 0x28)
+    c.regs.insert(0x29, 0x28)
+    c.regs.insert(0x2A, 0x38)
+    c.regs.insert(0x2B, 0x00)
+    c.regs.insert(0x2E, 0x00)
+    c.regs.insert(0x2F, 0x00)
+    c.regs.insert(0x30, 0x00)
+    c.regs.insert(0x31, 0x00)
+
+// A part at its reset values.
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), log: HashMap.new() }
+    load_defaults(c)
+    c.st.insert(0, 1)
+    c
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 9)
+    c.log.insert(n, v)
+    c.st.insert(9, n + 1)
+
+fn log_clear(c: Chip)
+    c.st.insert(9, 0)
+
+fn lw(r: Int, v: Int) -> Int
+    65536 + r * 256 + v
+
+fn lr(r: Int) -> Int
+    131072 + r * 256 + 1
+
+fn lp(ms: Int) -> Int
+    196608 + ms
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 9), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(4, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if data.len() != 2
+            return false
+        let reg = data[0] as Int
+        let v = data[1] as Int
+        log_push(self.c, lw(reg, v))
+        let n = at(self.c.st, 1) + 1
+        self.c.st.insert(1, n)
+        if addr != 0x10 or at(self.c.st, 0) == 0
+            return false
+        let from = at(self.c.st, 2)
+        if from > 0 and n >= from
+            return false
+        if reg == 0 and at(self.c.st, 7) == 1
+            return true
+        if reg == 0 and v >= 0x80
+            load_defaults(self.c)
+        self.c.regs.insert(reg, v)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        let reg = tx[0] as Int
+        log_push(self.c, 131072 + reg * 256 + n)
+        if addr != 0x10 or at(self.c.st, 0) == 0
+            return None
+        if reg + 1 == at(self.c.st, 5)
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, at(self.c.regs, reg + i) as u8)
+        Some(out)
+
+// The port: the package's own functions over the double, and a pause that
+// is logged and not waited.
+struct Dut
+    bus: FakeI2c
+    w: DeviceWiring
+
+impl Es8388Port for Dut
+    fn setup(self) -> Bool [hw]
+        es8388.i2c_setup(self.bus, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        es8388.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        es8388.i2c_write(self.bus, self.w, reg, v)
+
+    fn pause_ms(self, ms: Int) [hw]
+        log_push(self.bus.c, lp(ms))
+        self.bus.c.st.insert(6, at(self.bus.c.st, 6) + 1)
+
+fn dut(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c }, w: dev_bus.wiring_i2c(0, 0x10) }
+
+struct Link
+    st: HashMap<Int, Int>
+
+fn link() -> Link
+    Link { st: HashMap.new() }
+
+impl I2s for Link
+    fn configure(self, c: I2sConfig) -> Bool [hw]
+        self.st.insert(0, at(self.st, 0) + 1)
+        if at(self.st, 8) == 1
+            return false
+        self.st.insert(1, c.sample_rate)
+        self.st.insert(2, c.bit_depth)
+        self.st.insert(3, c.channels)
+        if c.role == I2sRole.I2sMaster
+            self.st.insert(4, 0)
+        else
+            self.st.insert(4, 1)
+        if c.format == I2sFormat.I2sPhilips
+            self.st.insert(5, 0)
+        else
+            self.st.insert(5, 1)
+        true
+
+    fn sample_rate(self) -> Int [hw]
+        at(self.st, 1)
+
+    fn enable(self) -> Bool [hw]
+        if at(self.st, 13) == 1
+            return false
+        self.st.insert(6, 1)
+        true
+
+    fn disable(self) [hw]
+        self.st.insert(6, 0)
+        self.st.insert(10, at(self.st, 10) + 1)
+
+    fn transmit(self, var buf: Vec[i32; 256]) -> Int [hw]
+        -1
+
+    fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
+        -1
+
+    fn xruns(self) -> Int [hw]
+        0
+
+fn fmt_of(rate: Int, depth: Int, ch: Int, framing: AudioFraming, master: Bool) -> AudioFormat
+    AudioFormat { sample_rate: rate, bit_depth: depth, channels: ch, framing: framing,
+                  codec_is_master: master }
+
+fn cfg(mclk: Int) -> Es8388Config
+    Es8388Config { mclk_hz: mclk, invert_bclk: false }
+
+fn db(m: Int) -> MilliDb
+    MilliDb { mdb: m }
+
+// ── The bus framing ──────────────────────────────────────────────────
+
+@test
+fn test_a_write_is_the_register_then_the_value_in_one_transaction() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(d.write_reg(0x2E, 0x1E))
+    test.assert_eq(reg_of(c, 0x2E), 0x1E)
+    log_is(c, [lw(0x2E, 0x1E)])
+
+@test
+fn test_a_register_write_is_eight_bits_and_the_open_step_is_named() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.reg_write(d, 0x2E, 0x11E))
+    test.assert_eq(reg_of(c, 0x2E), 0x1E)
+    log_clear(c)
+    test.assert(es8388.step_open(d))
+    log_is(c, [lr(0x19), lw(0x19, 0x26), lw(0x10, 0), lw(0x11, 0), lw(0x1A, 0), lw(0x1B, 0)])
+    c.st.insert(2, 1)
+    test.assert(not es8388.step_open(d))
+
+@test
+fn test_a_read_is_a_write_of_the_register_and_a_repeated_start() [io, hw]
+    let c = chip()
+    c.regs.insert(0x2E, 0x77)
+    let d = dut(c)
+    test.assert(es8388.reg_read(d, 0x2E) == Some(0x77))
+    log_is(c, [lr(0x2E)])
+    c.st.insert(5, 0x2E + 1)
+    test.assert(es8388.reg_read(d, 0x2E) == None)
+
+@test
+fn test_setup_sets_the_bus_to_400_khz_and_needs_an_address() [io, hw]
+    let c = chip()
+    test.assert(dut(c).setup())
+    test.assert_eq(at(c.st, 4), 400000)
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not Dut { bus: FakeI2c { c: c }, w: w }.setup())
+
+@test
+fn test_a_part_that_is_not_there_refuses_every_transaction() [io, hw]
+    let c = chip()
+    c.st.insert(0, 0)
+    let d = dut(c)
+    test.assert(not d.write_reg(0x2E, 1))
+    test.assert(es8388.reg_read(d, 0x2E) == None)
+    test.assert(not es8388.reg_update(d, 0x2E, 0xFF, 1))
+
+@test
+fn test_an_update_keeps_the_bits_outside_the_mask() [io, hw]
+    let c = chip()
+    c.regs.insert(0x0F, 0x5A)
+    let d = dut(c)
+    test.assert(es8388.reg_update(d, 0x0F, 0x0F, 0x03))
+    test.assert_eq(reg_of(c, 0x0F), 0x53)
+    log_is(c, [lr(0x0F), lw(0x0F, 0x53)])
+    c.st.insert(5, 0x0F + 1)
+    test.assert(not es8388.reg_update(d, 0x0F, 0x0F, 0x03))
+
+@test
+fn test_the_address_follows_the_ce_pin() [io]
+    test.assert_eq(es8388.address_of(false), 0x10)
+    test.assert_eq(es8388.address_of(true), 0x11)
+
+// ── The reset and the start ──────────────────────────────────────────
+
+@test
+fn test_the_reset_sets_scpreset_and_then_writes_the_default() [io, hw]
+    let c = chip()
+    c.regs.insert(0x2E, 0x1E)
+    c.regs.insert(0x00, 0x05)
+    let d = dut(c)
+    test.assert(es8388.step_reset(d))
+    log_is(c, [lw(0, 0x80), lw(0, 0x06)])
+    test.assert_eq(reg_of(c, 0x00), 0x06)
+    test.assert_eq(reg_of(c, 0x2E), 0x00)
+    c.st.insert(2, 1)
+    test.assert(not es8388.step_reset(d))
+    c.st.insert(2, 2)
+    c.st.insert(1, 0)
+    test.assert(not es8388.step_reset(d))
+
+@test
+fn test_the_start_resets_checks_ctrl1_and_opens_with_the_dac_muted_at_0_db() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x10, 0x55)
+    test.assert(es8388.start(d))
+    log_is(c, [lw(0, 0x80), lw(0, 0x06), lr(0),
+        lr(0x19), lw(0x19, 0x26),
+        lw(0x10, 0), lw(0x11, 0), lw(0x1A, 0), lw(0x1B, 0)])
+    test.assert_eq(at(c.st, 4), 400000)
+    test.assert_eq(reg_of(c, 0x10), 0)
+    test.assert_eq(reg_of(c, 0x19), 0x26)
+
+@test
+fn test_the_start_refuses_a_part_that_does_not_answer_or_does_not_reset() [io, hw]
+    let c = chip()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not es8388.start(Dut { bus: FakeI2c { c: c }, w: w }))
+    log_is(c, [])
+    c.st.insert(0, 0)
+    test.assert(not es8388.start(dut(c)))
+    log_clear(c)
+    let c2 = chip()
+    c2.st.insert(7, 1)
+    c2.regs.insert(0x00, 0x55)
+    test.assert(not es8388.start(dut(c2)))
+    log_is(c2, [lw(0, 0x80), lw(0, 0x06), lr(0)])
+    let c3 = chip()
+    c3.st.insert(5, 1)
+    test.assert(not es8388.start(dut(c3)))
+
+@test
+fn test_every_refusal_of_a_write_in_the_start_is_reported() [io, hw]
+    for n in 1..8
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert(not es8388.start(dut(c)))
+    let ok = chip()
+    ok.st.insert(2, 8)
+    test.assert(es8388.start(dut(ok)))
+
+// ── The clock ────────────────────────────────────────────────────────
+
+fn plan_is(p: ?RatioPlan, div2: Bool, ratio: Int, code: Int, double: Bool)
+    match p
+        Some(x) =>
+            test.assert(x.div2 == div2)
+            test.assert_eq(x.ratio, ratio)
+            test.assert_eq(x.code, code)
+            test.assert(x.double == double)
+        None    => test.assert(false)
+
+@test
+fn test_the_ratio_codes_are_table_2s() [io]
+    test.assert_eq(es8388.ratio_code(128), 0)
+    test.assert_eq(es8388.ratio_code(192), 1)
+    test.assert_eq(es8388.ratio_code(256), 2)
+    test.assert_eq(es8388.ratio_code(384), 3)
+    test.assert_eq(es8388.ratio_code(512), 4)
+    test.assert_eq(es8388.ratio_code(576), 5)
+    test.assert_eq(es8388.ratio_code(768), 6)
+    test.assert_eq(es8388.ratio_code(1024), 7)
+    test.assert_eq(es8388.ratio_code(1152), 8)
+    test.assert_eq(es8388.ratio_code(1408), 9)
+    test.assert_eq(es8388.ratio_code(1536), 10)
+    test.assert_eq(es8388.ratio_code(2112), 11)
+    test.assert_eq(es8388.ratio_code(2304), 12)
+    test.assert_eq(es8388.ratio_code(125), 16)
+    test.assert_eq(es8388.ratio_code(136), 17)
+    test.assert_eq(es8388.ratio_code(250), 18)
+    test.assert_eq(es8388.ratio_code(272), 19)
+    test.assert_eq(es8388.ratio_code(375), 20)
+    test.assert_eq(es8388.ratio_code(500), 21)
+    test.assert_eq(es8388.ratio_code(544), 22)
+    test.assert_eq(es8388.ratio_code(750), 23)
+    test.assert_eq(es8388.ratio_code(1000), 24)
+    test.assert_eq(es8388.ratio_code(1088), 25)
+    test.assert_eq(es8388.ratio_code(1496), 26)
+    test.assert_eq(es8388.ratio_code(1500), 27)
+    test.assert_eq(es8388.ratio_code(0), -1)
+    test.assert_eq(es8388.ratio_code(255), -1)
+    test.assert_eq(es8388.ratio_code(4608), -1)
+
+@test
+fn test_48_khz_from_12_288_mhz_is_the_ratio_256_code_00010() [io]
+    plan_is(es8388.clock_plan(12288000, 48000, false), false, 256, 2, false)
+    plan_is(es8388.clock_plan(12288000, 48000, true), false, 256, 2, false)
+
+@test
+fn test_the_master_rows_of_table_2_for_12_288_mhz() [io]
+    plan_is(es8388.clock_plan(12288000, 8000, true), false, 1536, 10, false)
+    plan_is(es8388.clock_plan(12288000, 12000, true), false, 1024, 7, false)
+    plan_is(es8388.clock_plan(12288000, 16000, true), false, 768, 6, false)
+    plan_is(es8388.clock_plan(12288000, 24000, true), false, 512, 4, false)
+    plan_is(es8388.clock_plan(12288000, 32000, true), false, 384, 3, false)
+    plan_is(es8388.clock_plan(12288000, 96000, true), false, 128, 0, true)
+
+@test
+fn test_the_master_rows_of_table_2_for_11_2896_18_432_and_16_9344_mhz() [io]
+    plan_is(es8388.clock_plan(11289600, 44100, true), false, 256, 2, false)
+    plan_is(es8388.clock_plan(11289600, 22050, true), false, 512, 4, false)
+    plan_is(es8388.clock_plan(11289600, 11025, true), false, 1024, 7, false)
+    plan_is(es8388.clock_plan(11289600, 88200, true), false, 128, 0, true)
+    plan_is(es8388.clock_plan(18432000, 8000, true), false, 2304, 12, false)
+    plan_is(es8388.clock_plan(18432000, 16000, true), false, 1152, 8, false)
+    plan_is(es8388.clock_plan(18432000, 32000, true), false, 576, 5, false)
+    plan_is(es8388.clock_plan(18432000, 48000, true), false, 384, 3, false)
+    plan_is(es8388.clock_plan(18432000, 96000, true), false, 192, 1, true)
+    plan_is(es8388.clock_plan(16934400, 44100, true), false, 384, 3, false)
+    plan_is(es8388.clock_plan(16934400, 11025, true), false, 1536, 10, false)
+    plan_is(es8388.clock_plan(16934400, 88200, true), false, 192, 1, true)
+
+@test
+fn test_the_clocks_of_twice_the_table_use_mclkdiv2() [io]
+    plan_is(es8388.clock_plan(24576000, 48000, true), true, 256, 2, false)
+    plan_is(es8388.clock_plan(24576000, 8000, true), true, 1536, 10, false)
+    plan_is(es8388.clock_plan(22579200, 44100, true), true, 256, 2, false)
+    plan_is(es8388.clock_plan(36864000, 96000, true), true, 192, 1, true)
+    plan_is(es8388.clock_plan(33868800, 88200, true), true, 192, 1, true)
+
+@test
+fn test_the_12_mhz_usb_clock_uses_the_ratios_from_10000() [io]
+    plan_is(es8388.clock_plan(12000000, 8000, true), false, 1500, 27, false)
+    plan_is(es8388.clock_plan(12000000, 48000, true), false, 250, 18, false)
+    plan_is(es8388.clock_plan(12000000, 12000, true), false, 1000, 24, false)
+    plan_is(es8388.clock_plan(12000000, 96000, true), false, 125, 16, true)
+    plan_is(es8388.clock_plan(24000000, 48000, true), true, 250, 18, false)
+    test.assert(es8388.clock_plan(12000000, 44100, true) == None)
+
+@test
+fn test_a_slave_takes_only_the_ratios_of_table_1() [io]
+    plan_is(es8388.clock_plan(12288000, 16000, false), false, 768, 6, false)
+    plan_is(es8388.clock_plan(12288000, 12000, false), false, 1024, 7, false)
+    plan_is(es8388.clock_plan(12288000, 96000, false), false, 128, 0, true)
+    plan_is(es8388.clock_plan(18432000, 96000, false), false, 192, 1, true)
+    test.assert(es8388.clock_plan(12288000, 8000, false) == None)
+    test.assert(es8388.clock_plan(11289600, 11025, true) != None)
+    test.assert(es8388.clock_plan(12288000, 50000, false) == None)
+    test.assert(es8388.slave_ratio_ok(128, true))
+    test.assert(not es8388.slave_ratio_ok(768, true))
+    test.assert(es8388.slave_ratio_ok(768, false))
+    test.assert(not es8388.slave_ratio_ok(128, false))
+
+@test
+fn test_any_other_clock_is_used_undivided() [io]
+    plan_is(es8388.clock_plan(4096000, 16000, false), false, 256, 2, false)
+    plan_is(es8388.clock_plan(8192000, 16000, true), false, 512, 4, false)
+    test.assert(es8388.clock_plan(16384000, 8000, true) == None)
+    test.assert(es8388.clock_plan(12288001, 48000, true) == None)
+    test.assert(es8388.clock_plan(12288000, 44100, true) == None)
+
+@test
+fn test_a_rate_outside_8_to_96_khz_or_no_clock_has_no_plan() [io]
+    test.assert(es8388.clock_plan(12288000, 7999, true) == None)
+    test.assert(es8388.clock_plan(12288000, 96001, true) == None)
+    test.assert(es8388.clock_plan(0, 48000, true) == None)
+    test.assert(es8388.clock_plan(-1, 48000, true) == None)
+    test.assert_eq(es8388.mclk_of(cfg(12288000)), 12288000)
+
+@test
+fn test_the_plan_for_a_format_refuses_what_the_part_cannot_frame() [io]
+    let c = cfg(12288000)
+    plan_is(es8388.plan_of(c, fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)),
+        false,
+        256,
+        2,
+        false)
+    test.assert(es8388.plan_of(c, fmt_of(48000, 16, 1, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(es8388.plan_of(c, fmt_of(48000, 8, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(es8388.plan_of(c, fmt_of(48000, 20, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(es8388.plan_of(c, fmt_of(44100, 16, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(es8388.plan_of(c, fmt_of(0, 16, 2, AudioFraming.AudioPhilips, false)) == None)
+
+// ── The serial port ──────────────────────────────────────────────────
+
+@test
+fn test_the_word_length_and_format_codes_are_the_data_sheets() [io]
+    test.assert_eq(es8388.wl_code(16), 3)
+    test.assert_eq(es8388.wl_code(24), 0)
+    test.assert_eq(es8388.wl_code(32), 4)
+    test.assert_eq(es8388.wl_code(8), -1)
+    test.assert_eq(es8388.wl_code(20), -1)
+    test.assert_eq(es8388.fmt_code(AudioFraming.AudioPhilips), 0)
+    test.assert_eq(es8388.fmt_code(AudioFraming.AudioLeftJustified), 1)
+
+@test
+fn test_the_i2s_settings_follow_the_framing_and_the_role() [io]
+    let a = es8388.i2s_config_of(fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false))
+    test.assert(a.role == I2sRole.I2sMaster)
+    test.assert(a.format == I2sFormat.I2sPhilips)
+    test.assert_eq(a.sample_rate, 48000)
+    test.assert_eq(a.bit_depth, 24)
+    let b = es8388.i2s_config_of(fmt_of(48000, 24, 2, AudioFraming.AudioLeftJustified, true))
+    test.assert(b.role == I2sRole.I2sSlave)
+    test.assert(b.format == I2sFormat.I2sLeftJustified)
+
+@test
+fn test_the_source_step_writes_the_role_the_divider_and_the_inversion() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    match es8388.clock_plan(12288000, 48000, false)
+        Some(p) =>
+            test.assert(es8388.step_source(d, cfg(12288000), p, false))
+            log_is(c, [lw(8, 0x00)])
+            test.assert(es8388.step_source(d, cfg(12288000), p, true))
+            log_is(c, [lw(8, 0x80)])
+            let inv = Es8388Config { mclk_hz: 12288000, invert_bclk: true }
+            test.assert(es8388.step_source(d, inv, p, true))
+            log_is(c, [lw(8, 0xA0)])
+        None    => test.assert(false)
+    match es8388.clock_plan(24576000, 48000, true)
+        Some(p) =>
+            test.assert(es8388.step_source(d, cfg(24576000), p, true))
+            log_is(c, [lw(8, 0xC0)])
+        None    => test.assert(false)
+
+@test
+fn test_the_ratio_step_writes_the_code_and_the_speed_mode_to_both_converters() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    match es8388.clock_plan(12288000, 48000, false)
+        Some(p) =>
+            test.assert(es8388.step_ratio(d, p))
+            log_is(c, [lw(0x0D, 2), lw(0x18, 2)])
+        None    => test.assert(false)
+    match es8388.clock_plan(12288000, 96000, false)
+        Some(p) =>
+            test.assert(es8388.step_ratio(d, p))
+            log_is(c, [lw(0x0D, 0x20), lw(0x18, 0x20)])
+        None    => test.assert(false)
+
+@test
+fn test_the_serial_port_step_keeps_the_channel_select_and_the_swap() [io, hw]
+    let c = chip()
+    c.regs.insert(0x0C, 0xC0)
+    c.regs.insert(0x17, 0x81)
+    let d = dut(c)
+    test.assert(es8388.step_serial_port(d, 3, 0, false))
+    log_is(c, [lr(0x0C), lw(0x0C, 0xCC), lr(0x17), lw(0x17, 0x99)])
+    test.assert(es8388.step_serial_port(d, 0, 3, true))
+    log_is(c, [lr(0x0C), lw(0x0C, 0xE3), lr(0x17), lw(0x17, 0xC7)])
+    c.st.insert(5, 0x17 + 1)
+    test.assert(not es8388.step_serial_port(d, 3, 0, false))
+
+@test
+fn test_dsp_and_right_justified_modes() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.dsp_format_set(d, 16, false))
+    log_is(c, [lr(0x0C), lw(0x0C, 0x0F), lr(0x17), lw(0x17, 0x1E)])
+    test.assert(es8388.dsp_format_set(d, 24, true))
+    log_is(c, [lr(0x0C), lw(0x0C, 0x23), lr(0x17), lw(0x17, 0x46)])
+    test.assert(es8388.rj_format_set(d, 32))
+    log_is(c, [lr(0x0C), lw(0x0C, 0x12), lr(0x17), lw(0x17, 0x24)])
+    test.assert(not es8388.dsp_format_set(d, 20, false))
+    test.assert(not es8388.rj_format_set(d, 8))
+    log_is(c, [])
+
+@test
+fn test_a_format_at_48_khz_16_bits_i2s_with_the_board_as_master() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    let f = fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)
+    test.assert(es8388.format_set(d, l, cfg(12288000), f))
+    log_is(c, [lw(8, 0x00), lw(0x0D, 2), lw(0x18, 2),
+        lr(0x0C), lw(0x0C, 0x0C), lr(0x17), lw(0x17, 0x18)])
+    test.assert_eq(at(l.st, 0), 1)
+    test.assert_eq(at(l.st, 1), 48000)
+    test.assert_eq(at(l.st, 2), 16)
+    test.assert_eq(at(l.st, 3), 2)
+    test.assert_eq(at(l.st, 4), 0)
+    test.assert_eq(at(l.st, 5), 0)
+    test.assert_eq(at(l.st, 6), 1)
+
+@test
+fn test_a_format_with_the_codec_as_master_and_a_clock_of_twice_the_table() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    let f = fmt_of(48000, 24, 2, AudioFraming.AudioLeftJustified, true)
+    test.assert(es8388.format_set(d, l, cfg(24576000), f))
+    log_is(c, [lw(8, 0xC0), lw(0x0D, 2), lw(0x18, 2),
+        lr(0x0C), lw(0x0C, 0x01), lr(0x17), lw(0x17, 0x02)])
+    test.assert_eq(at(l.st, 4), 1)
+    test.assert_eq(at(l.st, 5), 1)
+
+@test
+fn test_a_format_at_96_khz_32_bits_sets_double_speed() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    let f = fmt_of(96000, 32, 2, AudioFraming.AudioPhilips, false)
+    test.assert(es8388.format_set(d, l, cfg(12288000), f))
+    log_is(c, [lw(8, 0x00), lw(0x0D, 0x20), lw(0x18, 0x20),
+        lr(0x0C), lw(0x0C, 0x10), lr(0x17), lw(0x17, 0x20)])
+
+@test
+fn test_a_format_the_part_or_the_handle_refuses_writes_nothing() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    test.assert(not es8388.format_set(d, l, cfg(12288000), fmt_of(44100, 16, 2, AudioFraming.AudioPhilips, false)))
+    test.assert_eq(at(l.st, 0), 0)
+    l.st.insert(8, 1)
+    test.assert(not es8388.format_set(d, l, cfg(12288000), fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)))
+    test.assert_eq(at(l.st, 6), 0)
+    l.st.insert(8, 0)
+    l.st.insert(13, 1)
+    test.assert(not es8388.format_set(d, l, cfg(12288000), fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)))
+    log_is(c, [])
+
+@test
+fn test_every_refusal_of_a_write_in_the_format_is_reported() [io, hw]
+    let f = fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)
+    for n in 1..6
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert(not es8388.format_set(dut(c), link(), cfg(12288000), f))
+    let ok = chip()
+    ok.st.insert(2, 6)
+    test.assert(es8388.format_set(dut(ok), link(), cfg(12288000), f))
+
+// ── Power ────────────────────────────────────────────────────────────
+
+@test
+fn test_the_power_up_follows_the_user_guide_with_the_dac_muted_first() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.step_power_up(d))
+    log_is(c, [lr(0x19), lw(0x19, 0x26),
+        lw(0x02, 0xF3),
+        lw(0x2B, 0x80),
+        lw(0x00, 0x07), lp(100), lw(0x00, 0x05),
+        lw(0x01, 0x40),
+        lw(0x03, 0x00),
+        lw(0x04, 0x3C),
+        lw(0x26, 0x00), lw(0x27, 0xB8), lw(0x28, 0x38), lw(0x29, 0x38), lw(0x2A, 0xB8),
+        lw(0x02, 0x00)])
+    test.assert_eq(at(c.st, 6), 1)
+
+@test
+fn test_every_refusal_of_a_write_in_the_power_up_is_reported() [io, hw]
+    for n in 1..15
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert(not es8388.step_power_up(dut(c)))
+    let ok = chip()
+    ok.st.insert(2, 15)
+    test.assert(es8388.step_power_up(dut(ok)))
+    let silent = chip()
+    silent.st.insert(5, 0x19 + 1)
+    test.assert(not es8388.step_power_up(dut(silent)))
+
+@test
+fn test_the_power_down_mutes_both_holds_the_state_machines_and_powers_down() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.step_power_down(d))
+    log_is(c, [lr(0x0F), lw(0x0F, 0x24),
+        lr(0x19), lw(0x19, 0x26),
+        lw(0x02, 0xF3), lw(0x03, 0xFC), lw(0x04, 0xC0)])
+
+@test
+fn test_every_refusal_of_a_write_in_the_power_down_is_reported() [io, hw]
+    for n in 1..6
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert(not es8388.step_power_down(dut(c)))
+    let ok = chip()
+    ok.st.insert(2, 6)
+    test.assert(es8388.step_power_down(dut(ok)))
+
+@test
+fn test_power_on_and_off_through_the_handle() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    test.assert(es8388.power_set(d, l, true))
+    test.assert_eq(at(l.st, 10), 0)
+    log_clear(c)
+    test.assert(es8388.power_set(d, l, false))
+    test.assert_eq(at(l.st, 10), 1)
+    test.assert_eq(at(l.st, 6), 0)
+    c.st.insert(2, 1)
+    c.st.insert(1, 0)
+    test.assert(not es8388.power_set(d, l, false))
+    test.assert_eq(at(l.st, 10), 2)
+
+// ── Mute and gain ────────────────────────────────────────────────────
+
+@test
+fn test_the_dac_mute_is_dacctl3_bit_2_and_keeps_the_ramp_bits() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.mute_get(d) == Some(false))
+    test.assert(es8388.mute_set(d, true))
+    test.assert_eq(reg_of(c, 0x19), 0x26)
+    test.assert(es8388.mute_get(d) == Some(true))
+    test.assert(es8388.mute_set(d, false))
+    test.assert_eq(reg_of(c, 0x19), 0x22)
+    c.st.insert(5, 0x19 + 1)
+    test.assert(es8388.mute_get(d) == None)
+    test.assert(not es8388.mute_set(d, true))
+
+@test
+fn test_the_adc_mute_is_adcctl7_bit_2() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.adc_mute_set(d, true))
+    test.assert_eq(reg_of(c, 0x0F), 0x24)
+    test.assert(es8388.adc_mute_set(d, false))
+    test.assert_eq(reg_of(c, 0x0F), 0x20)
+
+@test
+fn test_the_output_driver_codes_run_from_minus_45_db_in_1_5_db_steps() [io]
+    test.assert(es8388.out_code(db(-45000)) == Some(0))
+    test.assert(es8388.out_code(db(0)) == Some(30))
+    test.assert(es8388.out_code(db(-6000)) == Some(26))
+    test.assert(es8388.out_code(db(-6100)) == Some(25))
+    test.assert(es8388.out_code(db(4500)) == Some(33))
+    test.assert(es8388.out_code(db(9000)) == Some(33))
+    test.assert(es8388.out_code(db(-45001)) == None)
+    test.assert_eq(es8388.out_mdb(0), -45000)
+    test.assert_eq(es8388.out_mdb(30), 0)
+    test.assert_eq(es8388.out_mdb(33), 4500)
+    test.assert_eq(es8388.out_mdb(34), 4500)
+    test.assert_eq(es8388.out_mdb(0xFF), 4500)
+
+@test
+fn test_the_digital_volume_codes_run_from_0_db_to_minus_96_db() [io]
+    test.assert(es8388.dvol_code(db(0)) == Some(0))
+    test.assert(es8388.dvol_code(db(-500)) == Some(1))
+    test.assert(es8388.dvol_code(db(-1200)) == Some(3))
+    test.assert(es8388.dvol_code(db(-96000)) == Some(192))
+    test.assert(es8388.dvol_code(db(6000)) == Some(0))
+    test.assert(es8388.dvol_code(db(-96001)) == None)
+    test.assert_eq(es8388.dvol_mdb(0), 0)
+    test.assert_eq(es8388.dvol_mdb(192), -96000)
+    test.assert_eq(es8388.dvol_mdb(0xFF), -96000)
+
+@test
+fn test_the_pga_codes_run_from_0_to_24_db_in_3_db_steps() [io]
+    test.assert(es8388.pga_code(db(0)) == Some(0))
+    test.assert(es8388.pga_code(db(2999)) == Some(0))
+    test.assert(es8388.pga_code(db(21000)) == Some(7))
+    test.assert(es8388.pga_code(db(24000)) == Some(8))
+    test.assert(es8388.pga_code(db(30000)) == Some(8))
+    test.assert(es8388.pga_code(db(-1)) == None)
+    test.assert_eq(es8388.pga_mdb(7), 21000)
+    test.assert_eq(es8388.pga_mdb(8), 24000)
+    test.assert_eq(es8388.pga_mdb(15), 24000)
+
+@test
+fn test_the_output_gain_sets_the_four_drivers_to_the_step_at_or_below() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.gain_set(d, CodecPath.CodecOutput, db(0)) == Some(db(0)))
+    log_is(c, [lw(0x2E, 0x1E), lw(0x2F, 0x1E), lw(0x30, 0x1E), lw(0x31, 0x1E)])
+    test.assert(es8388.gain_set(d, CodecPath.CodecOutput, db(-6100)) == Some(db(-7500)))
+    test.assert_eq(reg_of(c, 0x31), 25)
+    test.assert(es8388.gain_set(d, CodecPath.CodecOutput, db(-46000)) == None)
+    log_clear(c)
+    test.assert(es8388.gain_get(d, CodecPath.CodecOutput) == Some(db(-7500)))
+    log_is(c, [lr(0x2E)])
+    c.st.insert(5, 0x2E + 1)
+    test.assert(es8388.gain_get(d, CodecPath.CodecOutput) == None)
+
+@test
+fn test_every_refusal_of_a_write_in_the_output_gain_is_reported() [io, hw]
+    for n in 1..5
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert(es8388.gain_set(dut(c), CodecPath.CodecOutput, db(0)) == None)
+
+@test
+fn test_the_input_gain_sets_both_pgas_and_the_user_guides_21_db_is_0x77() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.gain_set(d, CodecPath.CodecInput, db(21000)) == Some(db(21000)))
+    log_is(c, [lw(0x09, 0x77)])
+    test.assert(es8388.gain_set(d, CodecPath.CodecInput, db(-1)) == None)
+    log_is(c, [])
+    test.assert(es8388.gain_get(d, CodecPath.CodecInput) == Some(db(21000)))
+    c.regs.insert(0x09, 0xF0)
+    test.assert(es8388.gain_get(d, CodecPath.CodecInput) == Some(db(24000)))
+    c.st.insert(5, 0x09 + 1)
+    test.assert(es8388.gain_get(d, CodecPath.CodecInput) == None)
+    c.st.insert(5, 0)
+    c.st.insert(2, 1)
+    test.assert(es8388.gain_set(d, CodecPath.CodecInput, db(0)) == None)
+
+@test
+fn test_the_pga_of_each_channel() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.pga_set(d, db(3000), db(12000)) == Some(db(3000)))
+    test.assert_eq(reg_of(c, 0x09), 0x14)
+    test.assert(es8388.pga_set(d, db(-1), db(0)) == None)
+    test.assert(es8388.pga_set(d, db(0), db(-1)) == None)
+
+@test
+fn test_the_dac_and_adc_volumes_are_half_decibel_steps() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.dac_volume_set(d, db(-1200)) == Some(db(-1000 - 500)))
+    test.assert_eq(reg_of(c, 0x1A), 3)
+    test.assert_eq(reg_of(c, 0x1B), 3)
+    test.assert(es8388.dac_volume_get(d) == Some(db(-1500)))
+    test.assert(es8388.dac_volume_set(d, db(-97000)) == None)
+    c.st.insert(5, 0x1A + 1)
+    test.assert(es8388.dac_volume_get(d) == None)
+    c.st.insert(5, 0)
+    c.st.insert(2, 1)
+    test.assert(es8388.dac_volume_set(d, db(0)) == None)
+    c.st.insert(2, 0)
+    test.assert(es8388.adc_volume_set(d, db(-500)) == Some(db(-500)))
+    test.assert_eq(reg_of(c, 0x10), 1)
+    test.assert_eq(reg_of(c, 0x11), 1)
+    test.assert(es8388.adc_volume_get(d) == Some(db(-500)))
+    test.assert(es8388.adc_volume_set(d, db(-97000)) == None)
+    c.st.insert(5, 0x10 + 1)
+    test.assert(es8388.adc_volume_get(d) == None)
+    c.st.insert(5, 0)
+    c.st.insert(2, 1)
+    test.assert(es8388.adc_volume_set(d, db(0)) == None)
+
+// ── The settings the trait has no place for ──────────────────────────
+
+@test
+fn test_the_four_inputs() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.input_set(d, InputSel.InLine2))
+    log_is(c, [lr(0x0A), lw(0x0A, 0x50)])
+    test.assert(es8388.input_set(d, InputSel.InLine1))
+    test.assert_eq(reg_of(c, 0x0A), 0x00)
+    log_clear(c)
+    test.assert(es8388.input_set(d, InputSel.InDiff1))
+    log_is(c, [lr(0x0A), lw(0x0A, 0xF0), lr(0x0B), lw(0x0B, 0x02)])
+    test.assert(es8388.input_set(d, InputSel.InDiff2))
+    log_is(c, [lr(0x0A), lw(0x0A, 0xF0), lr(0x0B), lw(0x0B, 0x82)])
+    c.st.insert(5, 0x0B + 1)
+    test.assert(not es8388.input_set(d, InputSel.InDiff1))
+
+@test
+fn test_the_adc_data_select_and_the_dac_mono_mix() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.adc_data_set(d, 3))
+    test.assert_eq(reg_of(c, 0x0C), 0xC0)
+    test.assert(es8388.adc_data_set(d, 0))
+    test.assert_eq(reg_of(c, 0x0C), 0x00)
+    log_clear(c)
+    test.assert(not es8388.adc_data_set(d, 4))
+    test.assert(not es8388.adc_data_set(d, -1))
+    log_is(c, [])
+    test.assert(es8388.dac_mono_set(d, true))
+    test.assert_eq(reg_of(c, 0x1D), 0x20)
+    test.assert(es8388.dac_mono_set(d, false))
+    test.assert_eq(reg_of(c, 0x1D), 0x00)
+
+@test
+fn test_the_output_drivers_are_enabled_in_pairs() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x04, 0x3C)
+    test.assert(es8388.outputs_set(d, true, false))
+    test.assert_eq(reg_of(c, 0x04), 0x30)
+    test.assert(es8388.outputs_set(d, false, true))
+    test.assert_eq(reg_of(c, 0x04), 0x0C)
+    test.assert(es8388.outputs_set(d, true, true))
+    test.assert_eq(reg_of(c, 0x04), 0x3C)
+    test.assert(es8388.outputs_set(d, false, false))
+    test.assert_eq(reg_of(c, 0x04), 0x00)
+
+@test
+fn test_one_pair_of_output_volumes() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.out_volume_set(d, false, db(-3000)) == Some(db(-3000)))
+    log_is(c, [lw(0x2E, 28), lw(0x2F, 28)])
+    test.assert(es8388.out_volume_set(d, true, db(1500)) == Some(db(1500)))
+    log_is(c, [lw(0x30, 31), lw(0x31, 31)])
+    test.assert(es8388.out_volume_set(d, true, db(-50000)) == None)
+    log_is(c, [])
+    c.st.insert(2, 1)
+    test.assert(es8388.out_volume_set(d, false, db(0)) == None)
+
+@test
+fn test_the_mixers_for_the_dac_the_line_and_the_pair_2() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.mixer_set(d, true, false, false, db(0)) == Some(db(0)))
+    log_is(c, [lw(0x26, 0x00), lw(0x27, 0x90), lw(0x2A, 0x90)])
+    test.assert(es8388.mixer_set(d, false, true, false, db(0)) == Some(db(0)))
+    log_is(c, [lw(0x26, 0x00), lw(0x27, 0x50), lw(0x2A, 0x50)])
+    test.assert(es8388.mixer_set(d, true, true, true, db(6000)) == Some(db(6000)))
+    log_is(c, [lw(0x26, 0x09), lw(0x27, 0xC0), lw(0x2A, 0xC0)])
+    test.assert(es8388.mixer_set(d, false, true, true, db(-15000)) == Some(db(-15000)))
+    log_is(c, [lw(0x26, 0x09), lw(0x27, 0x78), lw(0x2A, 0x78)])
+    test.assert(es8388.mixer_set(d, false, true, false, db(-16000)) == None)
+    log_is(c, [])
+    test.assert(es8388.mixer_set(d, false, true, false, db(9000)) == Some(db(6000)))
+    log_clear(c)
+    test.assert(es8388.line_code(db(-15000)) == Some(7))
+    test.assert(es8388.line_code(db(-15001)) == None)
+    for n in 1..4
+        let f = chip()
+        f.st.insert(2, n)
+        test.assert(es8388.mixer_set(dut(f), true, false, false, db(0)) == None)
+
+// ── The ALC ──────────────────────────────────────────────────────────
+
+@test
+fn test_the_voice_alc_with_the_data_sheets_codes() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.alc_set(d, es8388.alc_voice()))
+    log_is(c, [lw(0x12, 0xEA), lw(0x13, 0x80), lw(0x14, 0x12), lw(0x15, 0x06), lw(0x16, 0xC3)])
+
+@test
+fn test_the_generic_alc_with_the_data_sheets_codes() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.alc_set(d, es8388.alc_generic()))
+    log_is(c, [lw(0x12, 0xF8), lw(0x13, 0x30), lw(0x14, 0x57), lw(0x15, 0x06), lw(0x16, 0x89)])
+
+@test
+fn test_the_alc_flags_and_the_limiter_mode() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    let a = AlcConfig { select: 1, max_gain: 0, min_gain: 7, target: 15, hold: 9, decay: 10, attack: 10,
+                        limiter: true, zero_cross: true, timeout: true, window: 31, gate: false,
+                        gate_threshold: 31, gate_mute: false }
+    test.assert(es8388.alc_set(d, a))
+    log_is(c, [lw(0x12, 0x47), lw(0x13, 0xF9), lw(0x14, 0xAA), lw(0x15, 0xFF), lw(0x16, 0xF8)])
+
+// The voice configuration with the field number `i` of the list below set to
+// `x`: select, max_gain, min_gain, target, hold, decay, attack, window and
+// gate_threshold.
+fn alc_with(i: Int, x: Int) -> AlcConfig
+    let v = es8388.alc_voice()
+    AlcConfig { select: pick(i, 0, x, v.select), max_gain: pick(i, 1, x, v.max_gain),
+                min_gain: pick(i, 2, x, v.min_gain), target: pick(i, 3, x, v.target),
+                hold: pick(i, 4, x, v.hold), decay: pick(i, 5, x, v.decay),
+                attack: pick(i, 6, x, v.attack), limiter: v.limiter, zero_cross: v.zero_cross,
+                timeout: v.timeout, window: pick(i, 7, x, v.window), gate: v.gate,
+                gate_threshold: pick(i, 8, x, v.gate_threshold), gate_mute: v.gate_mute }
+
+fn pick(i: Int, at_i: Int, x: Int, other: Int) -> Int
+    if i == at_i
+        return x
+    other
+
+@test
+fn test_an_alc_field_outside_its_register_is_refused_without_a_write() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    let v = es8388.alc_voice()
+    test.assert(es8388.alc_valid(v))
+    test.assert(not es8388.alc_set(d, alc_with(0, 4)))
+    test.assert(not es8388.alc_set(d, alc_with(0, -1)))
+    test.assert(not es8388.alc_set(d, alc_with(1, 8)))
+    test.assert(not es8388.alc_set(d, alc_with(2, 8)))
+    test.assert(not es8388.alc_set(d, alc_with(1, -1)))
+    test.assert(not es8388.alc_set(d, alc_with(2, -1)))
+    test.assert(not es8388.alc_set(d, alc_with(3, 16)))
+    test.assert(not es8388.alc_set(d, alc_with(3, -1)))
+    test.assert(not es8388.alc_set(d, alc_with(4, 16)))
+    test.assert(not es8388.alc_set(d, alc_with(4, -1)))
+    test.assert(not es8388.alc_set(d, alc_with(5, 16)))
+    test.assert(not es8388.alc_set(d, alc_with(5, -1)))
+    test.assert(not es8388.alc_set(d, alc_with(6, 16)))
+    test.assert(not es8388.alc_set(d, alc_with(6, -1)))
+    test.assert(not es8388.alc_set(d, alc_with(7, 32)))
+    test.assert(not es8388.alc_set(d, alc_with(7, -1)))
+    test.assert(not es8388.alc_set(d, alc_with(8, 32)))
+    test.assert(not es8388.alc_set(d, alc_with(8, -1)))
+    log_is(c, [])
+
+@test
+fn test_every_refusal_of_a_write_in_the_alc_is_reported_and_it_turns_off() [io, hw]
+    for n in 1..6
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert(not es8388.alc_set(dut(c), es8388.alc_voice()))
+    let c2 = chip()
+    c2.regs.insert(0x12, 0xEA)
+    test.assert(es8388.alc_off(dut(c2)))
+    test.assert_eq(reg_of(c2, 0x12), 0x2A)
+
+// ── The type over absent hardware ────────────────────────────────────
+
+fn absent() -> es8388.Es8388<Link>
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    es8388.attach(BoardI2c { id: 0 }, w, link(), es8388.config_default(12288000))
+
+@test
+fn test_the_type_over_absent_hardware_answers_as_a_part_that_is_not_there() [io, hw]
+    let p = absent()
+    test.assert(not p.begin())
+    test.assert(p.reg(0x2E) == None)
+    test.assert(not p.set_reg(0x2E, 1))
+    test.assert(p.set_dac_volume(db(0)) == None)
+    test.assert(p.dac_volume() == None)
+    test.assert(p.set_adc_volume(db(0)) == None)
+    test.assert(p.adc_volume() == None)
+    test.assert(not p.set_adc_mute(true))
+    test.assert(p.set_pga(db(0), db(0)) == None)
+    test.assert(not p.set_input(InputSel.InLine1))
+    test.assert(not p.set_adc_data(0))
+    test.assert(not p.set_outputs(true, true))
+    test.assert(p.set_out_volume(false, db(0)) == None)
+    test.assert(p.set_mixer(true, false, false, db(0)) == None)
+    test.assert(not p.set_dac_mono(true))
+    test.assert(not p.set_alc(es8388.alc_voice()))
+    test.assert(not p.alc_disable())
+    test.assert(not p.set_dsp_format(16, false))
+    test.assert(not p.set_rj_format(16))
+    test.assert(not p.codec_set_mute(true))
+    test.assert(p.codec_is_muted() == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecOutput, db(0)) == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecInput, db(0)) == None)
+    test.assert(p.codec_gain(CodecPath.CodecOutput) == None)
+    test.assert(p.codec_gain(CodecPath.CodecInput) == None)
+
+@test
+fn test_power_and_format_on_absent_hardware_report_false_and_stop_the_handle() [io, hw]
+    let p = absent()
+    test.assert(not p.codec_set_power(true))
+    test.assert(not p.codec_set_power(false))
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    test.assert(not p.codec_set_format(f))
+    p.i2s_stop()
+
+// The real pause is the board's timer; one millisecond is waited here.
+@test
+fn test_the_pause_of_the_type_waits_on_the_boards_timer() [io, hw]
+    absent().pause_ms(1)
+    test.assert(true)
+
+@test
+fn test_the_configuration_has_the_clock_and_no_inversion() [io]
+    let c = es8388.config_default(12288000)
+    test.assert_eq(c.mclk_hz, 12288000)
+    test.assert(not c.invert_bclk)

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
+are path dependencies until they are published.
+
+- `codec_set_gain` and `codec_gain` take `CodecHeadphone` (the pair OUT1),
+  `CodecLine` (the pair OUT2), `CodecDac` and `CodecAdc` (the digital volumes).
+  They replace the inherent `set_out_volume`, `set_dac_volume`, `dac_volume`,
+  `set_adc_volume` and `adc_volume`. `CodecSpeaker` answers `None`.
+- `codec_select_output` powers OUT1 or OUT2 up or down; it replaces
+  `set_outputs`, which set both pairs in one call.
+- `codec_set_path_mute` and `codec_path_muted` mute and read the ADC for
+  `CodecInput` and `CodecAdc` and the DAC for `CodecOutput` and `CodecDac`;
+  they replace `set_adc_mute`. 0.1.0 had no way to read the ADC mute back.
+- The framings `AudioRightJustified`, `AudioDspA` and `AudioDspB` replace the
+  inherent `set_rj_format` and `set_dsp_format`; they are written with the
+  format, and the handle is configured for the same framing. `AudioPdm` is
+  refused.
+- `slot_bits` is passed to the I2S handle, so the data sheet's 64 bit clocks at
+  16 bits are `slot_bits` 32.
+- A record literal of `AudioFormat` adds `slot_bits`.
+
 ## 0.1.0
 
 The first release: a driver for Everest Semiconductor's ES8388 stereo audio

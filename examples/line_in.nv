@@ -42,7 +42,8 @@ use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
 use dev_bus
 use es8388
 
-// The stand-in for a board's I2S block that is not there.
+// The stand-in for a board's I2S block that is not there (planning page 3.5,
+// row "the hal": no board implements `I2s`).
 @value
 struct NoI2s
     id: Int
@@ -79,7 +80,7 @@ fn main() [hw]
         hal.uart.write("no answer from the codec at 0x10\n")
     else
         hal.uart.write("codec found\n")
-    let f = AudioFormat { sample_rate: 48000, bit_depth: 16, channels: 2,
+    let f = AudioFormat { sample_rate: 48000, bit_depth: 16, channels: 2, slot_bits: 0,
                           framing: AudioFraming.AudioPhilips, codec_is_master: false }
     if not part.codec_set_format(f)
         hal.uart.write("format refused\n")

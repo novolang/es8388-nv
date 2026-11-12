@@ -100,10 +100,12 @@
 //   * Double speed.  esp_codec_dev and Linux leave FsMode at single speed at
 //     96 kHz; the data sheet defines it as "double speed mode" and the
 //     driver sets it for rates above 50 kHz, the boundary of Table 1.
-//   * The word length of a slot.  The data sheet says LRCK/SCLK "is normally
-//     64".  `I2sConfig` has one bit depth and no slot width, so a 16-bit
-//     format asks the handle for 32 bit clocks per frame; whether the part
-//     takes 32 is NOT VERIFIED.  A program that wants 64 asks for 32 bits.
+//   * The slot of a sample.  The data sheet says LRCK/SCLK "is normally 64".
+//     `AudioFormat.slot_bits` says it: a 16-bit format with `slot_bits` 32 is
+//     64 bit clocks per frame, and the handle is configured for that
+//     (`i2s_config_of`).  A format with `slot_bits` 0 asks the handle for
+//     32 bit clocks per frame at 16 bits; whether the part takes 32 is NOT
+//     VERIFIED.
 
 use embedded_hal.{ BoardI2c, BoardTimer, I2cBus, Timer, I2s, I2sConfig, I2sRole, I2sFormat }
 use dev_bus.{ DeviceWiring, DevBytes }
@@ -405,13 +407,21 @@ pub fn wl_code(depth: Int) -> Int
         return 4
     -1
 
-// The format code of a framing: 0 for I2S, 1 for left-justified.  The part
-// has 2 for right-justified and 3 for DSP/PCM, which are `rj_format_set` and
-// `dsp_format_set`.
+// The format code of a framing: 0 for I2S, 1 for left-justified, 2 for
+// right-justified and 3 for DSP/PCM, mode A and mode B alike (`lrp_of` tells
+// them apart).  -1 for a PDM stream, which a codec has no port for.
 pub fn fmt_code(f: AudioFraming) -> Int
     match f
-        AudioFraming.AudioPhilips       => 0
-        AudioFraming.AudioLeftJustified => 1
+        AudioFraming.AudioPhilips        => 0
+        AudioFraming.AudioLeftJustified  => 1
+        AudioFraming.AudioRightJustified => 2
+        AudioFraming.AudioDspA           => 3
+        AudioFraming.AudioDspB           => 3
+        AudioFraming.AudioPdm            => -1
+
+// Whether a framing sets the polarity bit of the serial port: DSP mode B.
+pub fn lrp_of(f: AudioFraming) -> Bool
+    f == AudioFraming.AudioDspB
 
 // ── The named steps ──────────────────────────────────────────────────
 //
@@ -511,17 +521,25 @@ pub fn i2s_config_of(f: AudioFormat) -> I2sConfig
     var role = I2sRole.I2sMaster
     if f.codec_is_master
         role = I2sRole.I2sSlave
-    var layout = I2sFormat.I2sPhilips
-    if f.framing == AudioFraming.AudioLeftJustified
-        layout = I2sFormat.I2sLeftJustified
     I2sConfig { sample_rate: f.sample_rate, bit_depth: f.bit_depth, channels: f.channels,
-                role: role, format: layout }
+                slot_bits: f.slot_bits, role: role, format: layout_of(f.framing) }
+
+// The handle's framing for a codec framing.  A PDM stream has no I2S form;
+// `plan_of` refuses it before this is asked, and it answers I2S.
+fn layout_of(f: AudioFraming) -> I2sFormat
+    match f
+        AudioFraming.AudioPhilips        => I2sFormat.I2sPhilips
+        AudioFraming.AudioLeftJustified  => I2sFormat.I2sLeftJustified
+        AudioFraming.AudioRightJustified => I2sFormat.I2sRightJustified
+        AudioFraming.AudioDspA           => I2sFormat.I2sDspA
+        AudioFraming.AudioDspB           => I2sFormat.I2sDspB
+        AudioFraming.AudioPdm            => I2sFormat.I2sPhilips
 
 // The plan for a format, or `None` when the codec cannot make it: a depth
-// other than 16, 24 or 32, a mono format (the part frames two slots), or a
-// rate and clock `clock_plan` refuses.
+// other than 16, 24 or 32, a PDM framing, a mono format (the part frames two
+// slots), or a rate and clock `clock_plan` refuses.
 pub fn plan_of(c: Es8388Config, f: AudioFormat) -> ?RatioPlan
-    if not dev_audio.audio_format_valid(f) or wl_code(f.bit_depth) < 0 or f.channels != 2
+    if not dev_audio.audio_format_valid(f) or wl_code(f.bit_depth) < 0 or fmt_code(f.framing) < 0 or f.channels != 2
         return None
     clock_plan(mclk_of(c), f.sample_rate, f.codec_is_master)
 
@@ -535,7 +553,7 @@ pub fn format_set<P: Es8388Port, S: I2s>(p: P, i2s: S, c: Es8388Config, f: Audio
         return false
     if not i2s.enable()
         return false
-    step_source(p, c, plan, f.codec_is_master) and step_ratio(p, plan) and step_serial_port(p, wl_code(f.bit_depth), fmt_code(f.framing), false)
+    step_source(p, c, plan, f.codec_is_master) and step_ratio(p, plan) and step_serial_port(p, wl_code(f.bit_depth), fmt_code(f.framing), lrp_of(f.framing))
 
 // Powers the converters up or down.  Up is `step_power_up`: the DAC is
 // muted and stays muted until `codec_set_mute(false)`.  Down is
@@ -560,13 +578,39 @@ pub fn mute_get<P: Es8388Port>(p: P) -> ?Bool [hw]
     let Some(v) = reg_read(p, DACCTL3) else return None
     Some((v & MUTE_BIT) != 0)
 
-// Mutes or unmutes the ADC's digital output: ADCCTL7's mute bit.  The input
-// path of `AudioCodec` has no mute; this is the part's.
+// Mutes or unmutes the ADC's digital output: ADCCTL7's mute bit.
 pub fn adc_mute_set<P: Es8388Port>(p: P, on: Bool) -> Bool [hw]
     var flags = 0
     if on
         flags = MUTE_BIT
     reg_update(p, ADCCTL7, MUTE_BIT, flags)
+
+// Whether the ADC is muted; `None` when the part did not answer.
+pub fn adc_mute_get<P: Es8388Port>(p: P) -> ?Bool [hw]
+    let Some(v) = reg_read(p, ADCCTL7) else return None
+    Some((v & MUTE_BIT) != 0)
+
+// Mutes or unmutes one path.  The output and the DAC are the DAC's mute
+// (`mute_set`), the input and the ADC the ADC's (`adc_mute_set`); the
+// headphone, line and speaker drivers have no mute of their own and answer
+// false.
+pub fn path_mute_set<P: Es8388Port>(p: P, path: CodecPath, on: Bool) -> Bool [hw]
+    match path
+        CodecPath.CodecOutput => mute_set(p, on)
+        CodecPath.CodecDac    => mute_set(p, on)
+        CodecPath.CodecInput  => adc_mute_set(p, on)
+        CodecPath.CodecAdc    => adc_mute_set(p, on)
+        _                     => false
+
+// Whether one path is muted, on the same paths as `path_mute_set`; `None`
+// for the others and when the part did not answer.
+pub fn path_mute_get<P: Es8388Port>(p: P, path: CodecPath) -> ?Bool [hw]
+    match path
+        CodecPath.CodecOutput => mute_get(p)
+        CodecPath.CodecDac    => mute_get(p)
+        CodecPath.CodecInput  => adc_mute_get(p)
+        CodecPath.CodecAdc    => adc_mute_get(p)
+        _                     => None
 
 // The register code of a digital volume (the ADC's or the DAC's) for a gain
 // in thousandths of a decibel: 0 dB is code 0 and the step is 0.5 dB down to
@@ -621,16 +665,22 @@ fn output_gain_set<P: Es8388Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
         return None
     Some(MilliDb { mdb: out_mdb(code) })
 
-// Sets the output gain or the input gain to the largest step at or below
-// `g`: the gain set, or `None` when `g` is below the path's range or the
-// part did not take it.  The output gain is the four output drivers,
-// LOUT1, ROUT1, LOUT2 and ROUT2, together; the DAC's digital volume is
-// `dac_volume_set`.  The input gain is the PGA of both channels; the ADC's
-// digital volume is `adc_volume_set`.
+// Sets the gain of a path to the largest step at or below `g`: the gain
+// set, or `None` when `g` is below the path's range, the part has no such
+// path or it did not take the gain.  The output is the four output drivers,
+// LOUT1, ROUT1, LOUT2 and ROUT2, together; the headphone is the pair OUT1
+// and the line is the pair OUT2 (the part has no amplified speaker output).
+// The DAC and the ADC are their digital volumes (`dac_volume_set`,
+// `adc_volume_set`).  The input is the PGA of both channels.
 pub fn gain_set<P: Es8388Port>(p: P, path: CodecPath, g: MilliDb) -> ?MilliDb [hw]
     match path
-        CodecPath.CodecOutput => output_gain_set(p, g)
-        CodecPath.CodecInput  => pga_set(p, g, g)
+        CodecPath.CodecOutput    => output_gain_set(p, g)
+        CodecPath.CodecHeadphone => out_volume_set(p, false, g)
+        CodecPath.CodecLine      => out_volume_set(p, true, g)
+        CodecPath.CodecDac       => dac_volume_set(p, g)
+        CodecPath.CodecAdc       => adc_volume_set(p, g)
+        CodecPath.CodecInput     => pga_set(p, g, g)
+        CodecPath.CodecSpeaker   => None
 
 // Sets the PGA of the left and the right channel, each to the largest step
 // at or below its request: the left gain set, or `None` when either request
@@ -646,16 +696,27 @@ fn output_gain_get<P: Es8388Port>(p: P) -> ?MilliDb [hw]
     let Some(v) = reg_read(p, LOUT1VOL) else return None
     Some(MilliDb { mdb: out_mdb(v) })
 
+fn line_gain_get<P: Es8388Port>(p: P) -> ?MilliDb [hw]
+    let Some(v) = reg_read(p, LOUT2VOL) else return None
+    Some(MilliDb { mdb: out_mdb(v) })
+
 fn input_gain_get<P: Es8388Port>(p: P) -> ?MilliDb [hw]
     let Some(v) = reg_read(p, ADCCTL1) else return None
     Some(MilliDb { mdb: pga_mdb((v >> 4) & 0x0F) })
 
-// The gain of a path as the part holds it, or `None` when it did not
-// answer.  The output gain is LOUT1's; the input gain is the left PGA's.
+// The gain of a path as the part holds it, or `None` when the part has no
+// such path or did not answer.  The output and the headphone are LOUT1's, the
+// line LOUT2's, the DAC and the ADC their digital volumes, the input the left
+// PGA's.
 pub fn gain_get<P: Es8388Port>(p: P, path: CodecPath) -> ?MilliDb [hw]
     match path
-        CodecPath.CodecOutput => output_gain_get(p)
-        CodecPath.CodecInput  => input_gain_get(p)
+        CodecPath.CodecOutput    => output_gain_get(p)
+        CodecPath.CodecHeadphone => output_gain_get(p)
+        CodecPath.CodecLine      => line_gain_get(p)
+        CodecPath.CodecDac       => dac_volume_get(p)
+        CodecPath.CodecAdc       => adc_volume_get(p)
+        CodecPath.CodecInput     => input_gain_get(p)
+        CodecPath.CodecSpeaker   => None
 
 // ── Settings the trait has no place for ──────────────────────────────
 
@@ -721,15 +782,19 @@ pub fn dac_mono_set<P: Es8388Port>(p: P, on: Bool) -> Bool [hw]
         flags = 0x20
     reg_update(p, DACCTL7, 0x20, flags)
 
-// Enables the output drivers: LOUT1 and ROUT1 (`out1`), LOUT2 and ROUT2
-// (`out2`).  The power-up enables all four.
-pub fn outputs_set<P: Es8388Port>(p: P, out1: Bool, out2: Bool) -> Bool [hw]
+// Turns one output pair on or off in DACPOWER: the headphone pair LOUT1 and
+// ROUT1, or the line pair LOUT2 and ROUT2.  The power-up enables all four.
+// False for any other path, which the part has not.
+pub fn output_select<P: Es8388Port>(p: P, path: CodecPath, on: Bool) -> Bool [hw]
+    var mask = 0x30
+    if path == CodecPath.CodecLine
+        mask = 0x0C
+    elif path != CodecPath.CodecHeadphone
+        return false
     var flags = 0
-    if out1
-        flags = flags | 0x30
-    if out2
-        flags = flags | 0x0C
-    reg_update(p, DACPOWER, 0x3C, flags)
+    if on
+        flags = mask
+    reg_update(p, DACPOWER, mask, flags)
 
 // Sets the volume of LOUT1 and ROUT1 (`out2` false) or of LOUT2 and ROUT2:
 // the gain set, or `None` below -45 dB or when the part did not take it.
@@ -770,24 +835,6 @@ pub fn mixer_set<P: Es8388Port>(p: P, dac: Bool, line: Bool, line2: Bool,
     if not reg_write(p, MIXSEL, sel) or not reg_write(p, LMIX, v) or not reg_write(p, RMIX, v)
         return None
     Some(MilliDb { mdb: LINE_MAX_MDB - code * LINE_STEP_MDB })
-
-// Puts both serial ports in DSP/PCM mode, A (`b` false) or B (`b` true,
-// the polarity bit set), at the word length of `depth`; the handle is the
-// caller's to configure for it.  False for a depth the part has not.
-pub fn dsp_format_set<P: Es8388Port>(p: P, depth: Int, b: Bool) -> Bool [hw]
-    let wl = wl_code(depth)
-    if wl < 0
-        return false
-    step_serial_port(p, wl, 3, b)
-
-// Puts both serial ports in the right-justified format at the word length
-// of `depth`; `AudioFraming` has no such framing.  False for a depth the part
-// has not.
-pub fn rj_format_set<P: Es8388Port>(p: P, depth: Int) -> Bool [hw]
-    let wl = wl_code(depth)
-    if wl < 0
-        return false
-    step_serial_port(p, wl, 2, false)
 
 // ── The ALC ──────────────────────────────────────────────────────────
 
@@ -877,7 +924,8 @@ pub struct Es8388<S: I2s>
 // The codec at `w.addr` on the board's I2C bus, with the I2S handle `i2s`
 // for its samples.  Nothing is sent.  A struct with a generic field cannot
 // be a `@value`, so the codec is one cell of the arena, built in a `system`
-// block, the one allocation of the package.
+// block, the one allocation of the package (planning page 3.4, row "a generic
+// struct").
 pub fn attach<S: I2s>(bus: BoardI2c, w: DeviceWiring, i2s: S, cfg: Es8388Config) -> Es8388<S>
     system
         return Es8388 { bus: bus, w: w, i2s: i2s, cfg: cfg }
@@ -909,26 +957,6 @@ impl Es8388
     fn set_reg(self, r: Int, v: Int) -> Bool [hw]
         reg_write(self, r, v)
 
-    // The DAC digital volume (`dac_volume_set`).
-    fn set_dac_volume(self, g: MilliDb) -> ?MilliDb [hw]
-        dac_volume_set(self, g)
-
-    // The DAC digital volume as the part holds it.
-    fn dac_volume(self) -> ?MilliDb [hw]
-        dac_volume_get(self)
-
-    // The ADC digital volume (`adc_volume_set`).
-    fn set_adc_volume(self, g: MilliDb) -> ?MilliDb [hw]
-        adc_volume_set(self, g)
-
-    // The ADC digital volume as the part holds it.
-    fn adc_volume(self) -> ?MilliDb [hw]
-        adc_volume_get(self)
-
-    // The ADC mute (`adc_mute_set`).
-    fn set_adc_mute(self, on: Bool) -> Bool [hw]
-        adc_mute_set(self, on)
-
     // The PGA of each channel (`pga_set`).
     fn set_pga(self, left: MilliDb, right: MilliDb) -> ?MilliDb [hw]
         pga_set(self, left, right)
@@ -939,13 +967,6 @@ impl Es8388
 
     fn set_adc_data(self, sel: Int) -> Bool [hw]
         adc_data_set(self, sel)
-
-    // The output drivers (`outputs_set`, `out_volume_set`).
-    fn set_outputs(self, out1: Bool, out2: Bool) -> Bool [hw]
-        outputs_set(self, out1, out2)
-
-    fn set_out_volume(self, out2: Bool, g: MilliDb) -> ?MilliDb [hw]
-        out_volume_set(self, out2, g)
 
     // The output mixers (`mixer_set`) and the mono mix (`dac_mono_set`).
     fn set_mixer(self, dac: Bool, line: Bool, line2: Bool, line_gain: MilliDb) -> ?MilliDb [hw]
@@ -960,13 +981,6 @@ impl Es8388
 
     fn alc_disable(self) -> Bool [hw]
         alc_off(self)
-
-    // DSP and right-justified modes (`dsp_format_set`, `rj_format_set`).
-    fn set_dsp_format(self, depth: Int, b: Bool) -> Bool [hw]
-        dsp_format_set(self, depth, b)
-
-    fn set_rj_format(self, depth: Int) -> Bool [hw]
-        rj_format_set(self, depth)
 
     // Stops the I2S handle's clocks without powering the codec down.
     fn i2s_stop(self) [hw]
@@ -990,3 +1004,12 @@ impl AudioCodec[hw] for Es8388
 
     fn codec_gain(self, path: CodecPath) -> ?MilliDb [hw]
         gain_get(self, path)
+
+    fn codec_select_output(self, path: CodecPath, on: Bool) -> Bool [hw]
+        output_select(self, path, on)
+
+    fn codec_set_path_mute(self, path: CodecPath, on: Bool) -> Bool [hw]
+        path_mute_set(self, path, on)
+
+    fn codec_path_muted(self, path: CodecPath) -> ?Bool [hw]
+        path_mute_get(self, path)

@@ -17,8 +17,8 @@
 //
 // The I2S double's state, in `ist`: 0 configure calls, 1 sample rate, 2 bit
 // depth, 3 channels, 4 role (0 master, 1 slave), 5 format (0 Philips, 1
-// left-justified), 6 enabled, 8 refuse configure, 10 disable calls, 13
-// refuse enable.
+// left-justified, 2 right-justified, 3 DSP A, 4 DSP B), 6 enabled, 8 refuse
+// configure, 10 disable calls, 13 refuse enable, 14 slot bits.
 
 use std.test
 use embedded_hal.{ BoardI2c, I2cBus, I2s, I2sConfig, I2sRole, I2sFormat }
@@ -195,10 +195,17 @@ impl I2s for Link
             self.st.insert(4, 0)
         else
             self.st.insert(4, 1)
+        self.st.insert(14, c.slot_bits)
         if c.format == I2sFormat.I2sPhilips
             self.st.insert(5, 0)
-        else
+        elif c.format == I2sFormat.I2sLeftJustified
             self.st.insert(5, 1)
+        elif c.format == I2sFormat.I2sRightJustified
+            self.st.insert(5, 2)
+        elif c.format == I2sFormat.I2sDspA
+            self.st.insert(5, 3)
+        else
+            self.st.insert(5, 4)
         true
 
     fn sample_rate(self) -> Int [hw]
@@ -224,8 +231,12 @@ impl I2s for Link
         0
 
 fn fmt_of(rate: Int, depth: Int, ch: Int, framing: AudioFraming, master: Bool) -> AudioFormat
-    AudioFormat { sample_rate: rate, bit_depth: depth, channels: ch, framing: framing,
-                  codec_is_master: master }
+    AudioFormat { sample_rate: rate, bit_depth: depth, channels: ch, slot_bits: 0,
+                  framing: framing, codec_is_master: master }
+
+fn fmt_slot(depth: Int, slot: Int, framing: AudioFraming) -> AudioFormat
+    AudioFormat { sample_rate: 48000, bit_depth: depth, channels: 2, slot_bits: slot,
+                  framing: framing, codec_is_master: false }
 
 fn cfg(mclk: Int) -> Es8388Config
     Es8388Config { mclk_hz: mclk, invert_bclk: false }
@@ -500,6 +511,13 @@ fn test_the_word_length_and_format_codes_are_the_data_sheets() [io]
     test.assert_eq(es8388.wl_code(20), -1)
     test.assert_eq(es8388.fmt_code(AudioFraming.AudioPhilips), 0)
     test.assert_eq(es8388.fmt_code(AudioFraming.AudioLeftJustified), 1)
+    test.assert_eq(es8388.fmt_code(AudioFraming.AudioRightJustified), 2)
+    test.assert_eq(es8388.fmt_code(AudioFraming.AudioDspA), 3)
+    test.assert_eq(es8388.fmt_code(AudioFraming.AudioDspB), 3)
+    test.assert_eq(es8388.fmt_code(AudioFraming.AudioPdm), -1)
+    test.assert(es8388.lrp_of(AudioFraming.AudioDspB))
+    test.assert(not es8388.lrp_of(AudioFraming.AudioDspA))
+    test.assert(not es8388.lrp_of(AudioFraming.AudioPhilips))
 
 @test
 fn test_the_i2s_settings_follow_the_framing_and_the_role() [io]
@@ -511,6 +529,13 @@ fn test_the_i2s_settings_follow_the_framing_and_the_role() [io]
     let b = es8388.i2s_config_of(fmt_of(48000, 24, 2, AudioFraming.AudioLeftJustified, true))
     test.assert(b.role == I2sRole.I2sSlave)
     test.assert(b.format == I2sFormat.I2sLeftJustified)
+    test.assert_eq(b.slot_bits, 0)
+    let r = es8388.i2s_config_of(fmt_slot(16, 32, AudioFraming.AudioRightJustified))
+    test.assert(r.format == I2sFormat.I2sRightJustified)
+    test.assert_eq(r.slot_bits, 32)
+    test.assert(es8388.i2s_config_of(fmt_slot(16, 0, AudioFraming.AudioDspA)).format == I2sFormat.I2sDspA)
+    test.assert(es8388.i2s_config_of(fmt_slot(16, 0, AudioFraming.AudioDspB)).format == I2sFormat.I2sDspB)
+    test.assert(es8388.i2s_config_of(fmt_slot(16, 0, AudioFraming.AudioPdm)).format == I2sFormat.I2sPhilips)
 
 @test
 fn test_the_source_step_writes_the_role_the_divider_and_the_inversion() [io, hw]
@@ -561,17 +586,38 @@ fn test_the_serial_port_step_keeps_the_channel_select_and_the_swap() [io, hw]
     test.assert(not es8388.step_serial_port(d, 3, 0, false))
 
 @test
-fn test_dsp_and_right_justified_modes() [io, hw]
+fn test_dsp_and_right_justified_formats_reach_the_serial_ports_and_the_handle() [io, hw]
     let c = chip()
+    let l = link()
     let d = dut(c)
-    test.assert(es8388.dsp_format_set(d, 16, false))
-    log_is(c, [lr(0x0C), lw(0x0C, 0x0F), lr(0x17), lw(0x17, 0x1E)])
-    test.assert(es8388.dsp_format_set(d, 24, true))
-    log_is(c, [lr(0x0C), lw(0x0C, 0x23), lr(0x17), lw(0x17, 0x46)])
-    test.assert(es8388.rj_format_set(d, 32))
-    log_is(c, [lr(0x0C), lw(0x0C, 0x12), lr(0x17), lw(0x17, 0x24)])
-    test.assert(not es8388.dsp_format_set(d, 20, false))
-    test.assert(not es8388.rj_format_set(d, 8))
+    test.assert(es8388.format_set(d, l, cfg(12288000), fmt_slot(16, 0, AudioFraming.AudioDspA)))
+    test.assert_eq(reg_of(c, 0x0C), 0x0F)
+    test.assert_eq(reg_of(c, 0x17), 0x1E)
+    test.assert_eq(at(l.st, 5), 3)
+    test.assert(es8388.format_set(d, l, cfg(12288000), fmt_slot(24, 0, AudioFraming.AudioDspB)))
+    test.assert_eq(reg_of(c, 0x0C), 0x23)
+    test.assert_eq(reg_of(c, 0x17), 0x46)
+    test.assert_eq(at(l.st, 5), 4)
+    test.assert(es8388.format_set(d, l, cfg(12288000), fmt_slot(32, 0, AudioFraming.AudioRightJustified)))
+    test.assert_eq(reg_of(c, 0x0C), 0x12)
+    test.assert_eq(reg_of(c, 0x17), 0x24)
+    test.assert_eq(at(l.st, 5), 2)
+
+@test
+fn test_the_slot_width_reaches_the_handle_and_a_pdm_framing_is_refused() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    test.assert(es8388.format_set(d, l, cfg(12288000), fmt_slot(16, 32, AudioFraming.AudioPhilips)))
+    test.assert_eq(at(l.st, 14), 32)
+    test.assert(es8388.format_set(d, l, cfg(12288000), fmt_slot(16, 0, AudioFraming.AudioPhilips)))
+    test.assert_eq(at(l.st, 14), 0)
+    let n = at(l.st, 0)
+    log_clear(c)
+    test.assert(not es8388.format_set(d, l, cfg(12288000), fmt_slot(16, 0, AudioFraming.AudioPdm)))
+    test.assert(es8388.plan_of(cfg(12288000), fmt_slot(16, 0, AudioFraming.AudioPdm)) == None)
+    test.assert(es8388.plan_of(cfg(12288000), fmt_slot(16, 8, AudioFraming.AudioPhilips)) == None)
+    test.assert_eq(at(l.st, 0), n)
     log_is(c, [])
 
 @test
@@ -727,8 +773,35 @@ fn test_the_adc_mute_is_adcctl7_bit_2() [io, hw]
     let d = dut(c)
     test.assert(es8388.adc_mute_set(d, true))
     test.assert_eq(reg_of(c, 0x0F), 0x24)
+    test.assert(es8388.adc_mute_get(d) == Some(true))
     test.assert(es8388.adc_mute_set(d, false))
     test.assert_eq(reg_of(c, 0x0F), 0x20)
+    test.assert(es8388.adc_mute_get(d) == Some(false))
+    c.st.insert(5, 0x0F + 1)
+    test.assert(es8388.adc_mute_get(d) == None)
+
+@test
+fn test_a_path_mute_is_the_dac_for_the_output_and_the_adc_for_the_input() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.path_mute_set(d, CodecPath.CodecInput, true))
+    test.assert_eq(reg_of(c, 0x0F), 0x24)
+    test.assert(es8388.path_mute_get(d, CodecPath.CodecInput) == Some(true))
+    test.assert(es8388.path_mute_get(d, CodecPath.CodecAdc) == Some(true))
+    test.assert(es8388.path_mute_set(d, CodecPath.CodecAdc, false))
+    test.assert_eq(reg_of(c, 0x0F), 0x20)
+    test.assert(es8388.path_mute_set(d, CodecPath.CodecOutput, true))
+    test.assert_eq(reg_of(c, 0x19), 0x26)
+    test.assert(es8388.path_mute_get(d, CodecPath.CodecOutput) == Some(true))
+    test.assert(es8388.path_mute_get(d, CodecPath.CodecDac) == Some(true))
+    test.assert(es8388.path_mute_set(d, CodecPath.CodecDac, false))
+    test.assert_eq(reg_of(c, 0x19), 0x22)
+    log_clear(c)
+    test.assert(not es8388.path_mute_set(d, CodecPath.CodecHeadphone, true))
+    test.assert(not es8388.path_mute_set(d, CodecPath.CodecLine, true))
+    test.assert(not es8388.path_mute_set(d, CodecPath.CodecSpeaker, true))
+    test.assert(es8388.path_mute_get(d, CodecPath.CodecHeadphone) == None)
+    log_is(c, [])
 
 @test
 fn test_the_output_driver_codes_run_from_minus_45_db_in_1_5_db_steps() [io]
@@ -783,6 +856,38 @@ fn test_the_output_gain_sets_the_four_drivers_to_the_step_at_or_below() [io, hw]
     log_is(c, [lr(0x2E)])
     c.st.insert(5, 0x2E + 1)
     test.assert(es8388.gain_get(d, CodecPath.CodecOutput) == None)
+
+@test
+fn test_the_headphone_and_the_line_are_the_two_output_pairs() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.gain_set(d, CodecPath.CodecHeadphone, db(-3000)) == Some(db(-3000)))
+    log_is(c, [lw(0x2E, 28), lw(0x2F, 28)])
+    test.assert(es8388.gain_set(d, CodecPath.CodecLine, db(1500)) == Some(db(1500)))
+    log_is(c, [lw(0x30, 31), lw(0x31, 31)])
+    test.assert(es8388.gain_set(d, CodecPath.CodecLine, db(-50000)) == None)
+    log_is(c, [])
+    test.assert(es8388.gain_get(d, CodecPath.CodecHeadphone) == Some(db(-3000)))
+    test.assert(es8388.gain_get(d, CodecPath.CodecLine) == Some(db(1500)))
+    c.st.insert(5, 0x30 + 1)
+    test.assert(es8388.gain_get(d, CodecPath.CodecLine) == None)
+    c.st.insert(5, 0)
+    log_clear(c)
+    test.assert(es8388.gain_set(d, CodecPath.CodecSpeaker, db(0)) == None)
+    test.assert(es8388.gain_get(d, CodecPath.CodecSpeaker) == None)
+    log_is(c, [])
+
+@test
+fn test_the_dac_and_the_adc_are_their_digital_volumes_on_the_trait() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(es8388.gain_set(d, CodecPath.CodecDac, db(-1200)) == Some(db(-1500)))
+    test.assert_eq(reg_of(c, 0x1A), 3)
+    test.assert(es8388.gain_get(d, CodecPath.CodecDac) == Some(db(-1500)))
+    test.assert(es8388.gain_set(d, CodecPath.CodecAdc, db(-500)) == Some(db(-500)))
+    test.assert_eq(reg_of(c, 0x10), 1)
+    test.assert(es8388.gain_get(d, CodecPath.CodecAdc) == Some(db(-500)))
+    test.assert(es8388.gain_set(d, CodecPath.CodecDac, db(-97000)) == None)
 
 @test
 fn test_every_refusal_of_a_write_in_the_output_gain_is_reported() [io, hw]
@@ -879,18 +984,22 @@ fn test_the_adc_data_select_and_the_dac_mono_mix() [io, hw]
     test.assert_eq(reg_of(c, 0x1D), 0x00)
 
 @test
-fn test_the_output_drivers_are_enabled_in_pairs() [io, hw]
+fn test_the_output_drivers_are_selected_in_pairs() [io, hw]
     let c = chip()
     let d = dut(c)
     c.regs.insert(0x04, 0x3C)
-    test.assert(es8388.outputs_set(d, true, false))
+    test.assert(es8388.output_select(d, CodecPath.CodecLine, false))
     test.assert_eq(reg_of(c, 0x04), 0x30)
-    test.assert(es8388.outputs_set(d, false, true))
-    test.assert_eq(reg_of(c, 0x04), 0x0C)
-    test.assert(es8388.outputs_set(d, true, true))
-    test.assert_eq(reg_of(c, 0x04), 0x3C)
-    test.assert(es8388.outputs_set(d, false, false))
+    test.assert(es8388.output_select(d, CodecPath.CodecHeadphone, false))
     test.assert_eq(reg_of(c, 0x04), 0x00)
+    test.assert(es8388.output_select(d, CodecPath.CodecLine, true))
+    test.assert_eq(reg_of(c, 0x04), 0x0C)
+    test.assert(es8388.output_select(d, CodecPath.CodecHeadphone, true))
+    test.assert_eq(reg_of(c, 0x04), 0x3C)
+    log_clear(c)
+    test.assert(not es8388.output_select(d, CodecPath.CodecSpeaker, true))
+    test.assert(not es8388.output_select(d, CodecPath.CodecOutput, true))
+    log_is(c, [])
 
 @test
 fn test_one_pair_of_output_volumes() [io, hw]
@@ -1020,22 +1129,24 @@ fn test_the_type_over_absent_hardware_answers_as_a_part_that_is_not_there() [io,
     test.assert(not p.begin())
     test.assert(p.reg(0x2E) == None)
     test.assert(not p.set_reg(0x2E, 1))
-    test.assert(p.set_dac_volume(db(0)) == None)
-    test.assert(p.dac_volume() == None)
-    test.assert(p.set_adc_volume(db(0)) == None)
-    test.assert(p.adc_volume() == None)
-    test.assert(not p.set_adc_mute(true))
+    test.assert(p.codec_set_gain(CodecPath.CodecDac, db(0)) == None)
+    test.assert(p.codec_gain(CodecPath.CodecDac) == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecAdc, db(0)) == None)
+    test.assert(p.codec_gain(CodecPath.CodecAdc) == None)
     test.assert(p.set_pga(db(0), db(0)) == None)
     test.assert(not p.set_input(InputSel.InLine1))
     test.assert(not p.set_adc_data(0))
-    test.assert(not p.set_outputs(true, true))
-    test.assert(p.set_out_volume(false, db(0)) == None)
+    test.assert(not p.codec_select_output(CodecPath.CodecHeadphone, true))
+    test.assert(not p.codec_set_path_mute(CodecPath.CodecInput, true))
+    test.assert(not p.codec_set_path_mute(CodecPath.CodecOutput, true))
+    test.assert(p.codec_path_muted(CodecPath.CodecInput) == None)
+    test.assert(p.codec_path_muted(CodecPath.CodecOutput) == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecHeadphone, db(0)) == None)
+    test.assert(p.codec_gain(CodecPath.CodecLine) == None)
     test.assert(p.set_mixer(true, false, false, db(0)) == None)
     test.assert(not p.set_dac_mono(true))
     test.assert(not p.set_alc(es8388.alc_voice()))
     test.assert(not p.alc_disable())
-    test.assert(not p.set_dsp_format(16, false))
-    test.assert(not p.set_rj_format(16))
     test.assert(not p.codec_set_mute(true))
     test.assert(p.codec_is_muted() == None)
     test.assert(p.codec_set_gain(CodecPath.CodecOutput, db(0)) == None)

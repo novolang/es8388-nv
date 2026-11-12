@@ -87,7 +87,7 @@ fn main() [hw]
     if not part.begin()
         hal.uart.write("no answer from the codec at 0x10\n")
         return
-    let f = AudioFormat { sample_rate: 48000, bit_depth: 16, channels: 2,
+    let f = AudioFormat { sample_rate: 48000, bit_depth: 16, channels: 2, slot_bits: 0,
                           framing: AudioFraming.AudioPhilips, codec_is_master: false }
     if part.codec_set_format(f) and part.codec_set_power(true)
         let set = part.codec_set_gain(CodecPath.CodecOutput, MilliDb { mdb: -12000 })
@@ -195,14 +195,13 @@ passes it with the board's I2C bus, the wiring and the I2S handle to
 | `codec_set_format(f)` | configures and enables the I2S handle, then sets the role, the clock ratio and the serial port |
 | `codec_set_power(on)` | runs the user guide's start-up with the DAC muted, or its power-down, and disables the handle |
 | `codec_set_mute(on)`, `codec_is_muted()` | the DAC's mute bit |
-| `codec_set_gain(path, g)`, `codec_gain(path)` | the four output drivers, or the PGA of both channels, to the largest step at or below `g` |
-| `set_dac_volume(g)`, `set_adc_volume(g)` | the digital volumes, 0 to -96 dB in 0.5 dB steps |
-| `set_adc_mute(on)`, `set_pga(l, r)` | the ADC mute and a PGA for each channel |
+| `codec_set_gain(path, g)`, `codec_gain(path)` | the four output drivers together (`CodecOutput`), the pair OUT1 (`CodecHeadphone`), the pair OUT2 (`CodecLine`), the DAC's or the ADC's digital volume (`CodecDac`, `CodecAdc`, 0 to -96 dB in 0.5 dB steps), or the PGA of both channels (`CodecInput`), to the largest step at or below `g`; `CodecSpeaker` answers `None` |
+| `codec_select_output(path, on)` | powers the pair OUT1 (`CodecHeadphone`) or OUT2 (`CodecLine`) up or down in DACPOWER |
+| `codec_set_path_mute(path, on)`, `codec_path_muted(path)` | the DAC's mute for `CodecOutput` and `CodecDac`, the ADC's mute for `CodecInput` and `CodecAdc` |
+| `set_pga(l, r)` | a PGA for each channel |
 | `set_input(sel)`, `set_adc_data(sel)` | LIN1, LIN2 or a differential pair; which ADC fills which slot |
-| `set_outputs(o1, o2)`, `set_out_volume(o2, g)` | enable and set one output pair |
 | `set_mixer(dac, line, line2, gain)`, `set_dac_mono(on)` | the output mixers and the mono mix |
 | `set_alc(cfg)`, `alc_disable()` | the ALC and noise gate from an `AlcConfig` |
-| `set_dsp_format(depth, b)`, `set_rj_format(depth)` | DSP/PCM mode A or B, and the right-justified format |
 | `reg(r)`, `set_reg(r, v)`, `i2s_stop()` | one register, a write, and the handle's clocks stopped |
 
 The steps are functions over `Es8388Port`, a trait a type holding an I2C bus
@@ -226,8 +225,8 @@ and `step_power_down`. Their order is the one place to read the sequences:
 step, from -45 dB to +4.5 dB in 1.5 dB steps; 0 dB is code 30, the value the
 user guide writes. On the input path it sets the PGA of both channels, from 0
 to +24 dB in 3 dB steps; the user guide's +21 dB is 0x77. The digital volumes
-are separate: `set_dac_volume` and `set_adc_volume`, 0 dB down to -96 dB in 0.5
-dB steps. The gain a call sets is never above the request, and a request below
+are the paths `CodecDac` and `CodecAdc`, 0 dB down to -96 dB in 0.5 dB steps;
+`CodecHeadphone` and `CodecLine` set one output pair, OUT1 and OUT2. The gain a call sets is never above the request, and a request below
 the range sets nothing. The reset leaves the output drivers at -45 dB and both
 digital volumes at -96 dB; `begin` moves the digital volumes to 0 dB and leaves
 the drivers quiet until the program sets a gain.
@@ -257,12 +256,15 @@ refuses a field outside its register without writing anything.
    set `set_mixer` sets it again.
 5. The part frames two slots. A mono format is refused; send a mono signal in
    both slots, or use `set_adc_data` and `set_dac_mono`.
-6. `AudioFraming` names the I2S and left-justified formats only. DSP mode and
-   the right-justified format are `set_dsp_format` and `set_rj_format`.
+6. The serial port takes the framings `AudioPhilips`, `AudioLeftJustified`,
+   `AudioRightJustified`, `AudioDspA` and `AudioDspB` (DSP mode B sets the
+   polarity bit). `AudioPdm` is refused: the part has no PDM input.
 7. The data sheet says the bit clock is normally 64 times the word clock.
-   `I2sConfig` has one bit depth and no slot width, so a 16-bit format asks the
-   handle for 32 bit clocks per frame, whether the part takes that is NOT
-   VERIFIED, and a program that wants 64 asks for 32 bits.
+   `AudioFormat.slot_bits` says it: a 16-bit format with `slot_bits` 32 is 64
+   bit clocks per frame, and the handle is configured for that. With `slot_bits`
+   0 a 16-bit format asks the handle for 32 bit clocks per frame; whether the
+   part takes that is NOT VERIFIED. In master mode the part makes the bit clock
+   itself (BCLKDIV 0), and the driver does not check that it gives the slot.
 
 ## What is not included
 
@@ -283,15 +285,17 @@ refuses a field outside its register without writing anything.
 
 ## Where the traits fall short
 
-- `AudioCodec` has one output gain and one input gain and no input mute. The
-  output gain here is the four output drivers; the DAC volume, the ADC volume
-  and the ADC mute are the driver's own functions.
-- `AudioFraming` has two framings; the part also has the right-justified and
-  the DSP/PCM modes. The driver's own `set_rj_format` and `set_dsp_format`
-  cover them.
-- `I2sConfig` has one `bit_depth`, which is both the slot width and the sample
-  width, so a codec that takes 24-bit data in a 32-bit slot, or 16-bit data
-  in a 64-clock frame, cannot say so.
+- The headphone and the line are the pairs OUT1 and OUT2 here. The part has
+  no amplified speaker output, so `CodecSpeaker` answers `None` and `false`.
+  The per-channel PGA, the input choice, the output mixers, the mono mix and the
+  ALC are the driver's own functions: the trait names no place for them.
+- The part answers its control port without a master clock, so `codec_start`
+  keeps the trait's body (0 microseconds, nothing started) and the reset and
+  check of CTRL1 stay in the driver's own `begin`.
+- A generic struct cannot be `@value`, so each `attach` allocates one arena
+  cell (planning page 3.4, row "a generic struct").
+- No board implements `I2s` and there is no `hal.i2s` hook, so the device
+  program runs against the stand-in `NoI2s` (planning page 3.5, row "the hal").
 - A trait method gets a plain `self`, so the driver keeps no state between
   calls. The part's registers are readable, and every change is a
   read-modify-write, so the driver needs none.

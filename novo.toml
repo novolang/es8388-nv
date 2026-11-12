@@ -1,6 +1,6 @@
 [package]
 name        = "es8388-nv"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "A driver for Everest Semiconductor's ES8388 stereo audio codec with headphone amplifier on an I2C control bus and a board's I2S handle: the MCLK to LRCK ratio table for 8 to 96 kHz, master and slave serial port, I2S, left-justified, right-justified and DSP formats, the ADC input choice and PGA gain, the ALC as a configuration record, the DAC volume, mute, output mixers and the four output volumes, and the power-up and power-down sequences in the order of the user guide, as devices-nv's AudioCodec."
 license     = "Apache-2.0"
 stability   = "experimental"
